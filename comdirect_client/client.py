@@ -1,29 +1,31 @@
-"""Main Comdirect API client implementation."""
+"""Main Comdirect API client implementation with Bravado integration."""
 
 import asyncio
 import json
 import logging
 import time
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional, cast
 
 import httpx
+from bravado.client import SwaggerClient
+from bravado.exception import HTTPError
 
+from comdirect_client.bravado_adapter import ComdirectBravadoClient
 from comdirect_client.exceptions import (
-    AccountNotFoundError,
     AuthenticationError,
     NetworkTimeoutError,
-    ServerError,
     SessionActivationError,
     TANTimeoutError,
     TokenExpiredError,
-    ValidationError,
 )
-from comdirect_client.models import AccountBalance, Transaction
 from comdirect_client.token_storage import TokenPersistence, TokenStorageError
 
 logger = logging.getLogger(__name__)
+
+# Swagger spec URL
+SWAGGER_SPEC_URL = "https://kunde.comdirect.de/cms/media/comdirect_rest_api_swagger.json"
 
 
 def utc_now() -> datetime:
@@ -39,14 +41,18 @@ def sanitize_token(token: str, prefix_length: int = 8) -> str:
 
 
 class ComdirectClient:
-    """Async client for the Comdirect Banking API.
+    """Async client for the Comdirect Banking API with Bravado integration.
 
     This client handles:
     - OAuth2 + TAN authentication flow
     - Automatic token refresh via asyncio
-    - Account balance and transaction retrieval
+    - Token persistence across restarts
     - Reauth callback on token expiration
     - Comprehensive logging with sensitive data sanitization
+
+    The client uses Bravado to generate API methods from the Swagger specification.
+    After authentication, access the Bravado client via the `api` attribute to use
+    all Comdirect API endpoints.
 
     IMPORTANT - Persistent Client Usage:
         This client should be kept alive (persistent) throughout your application's
@@ -64,7 +70,7 @@ class ComdirectClient:
         - Use token_storage_path to persist tokens across application restarts
         - When tokens are loaded from storage, the refresh task starts automatically
 
-    Example (recommended - persistent client):
+    Example:
         ```python
         # Create once at startup
         client = ComdirectClient(
@@ -75,24 +81,21 @@ class ComdirectClient:
             token_storage_path="/path/to/tokens.json",
         )
 
-        # Reuse for all operations
-        await client.authenticate()  # TAN approval once
-        balances = await client.get_account_balances()  # Uses same session
-        transactions = await client.get_transactions(...)  # Still same session
+        # Authenticate (requires TAN approval)
+        await client.authenticate()
+
+        # Use Bravado-generated API methods (note: call .result() to get awaitable)
+        balances_response = await client.api.banking.clients.user.v2.accounts.balances.get(
+            user="user"
+        ).result()
+        balances = balances_response.values  # Access the values from response
+
+        transactions_response = await client.api.banking.v1.accounts.transactions.get(
+            accountId="account-uuid"
+        ).result()
+        transactions = transactions_response.values  # Access the values from response
 
         # Token auto-refreshes in background - no new TAN needed!
-        ```
-
-    Example (NOT recommended - new client per operation):
-        ```python
-        # DON'T DO THIS - requires TAN approval every ~10 minutes
-        async def get_balance():
-            async with ComdirectClient(...) as client:
-                await client.authenticate()  # TAN approval needed
-                return await client.get_account_balances()
-            # Client destroyed, refresh task cancelled!
-
-        # Next call after token expires requires new TAN
         ```
     """
 
@@ -103,6 +106,7 @@ class ComdirectClient:
         username: str,
         password: str,
         base_url: str = "https://api.comdirect.de",
+        swagger_spec_url: str = SWAGGER_SPEC_URL,
         reauth_callback: Optional[Callable[[str], None]] = None,
         tan_status_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
         token_refresh_threshold_seconds: int = 120,
@@ -117,6 +121,7 @@ class ComdirectClient:
             username: Comdirect account username
             password: Comdirect account password
             base_url: API base URL (default: production API)
+            swagger_spec_url: URL to Swagger/OpenAPI specification (default: official Comdirect spec)
             reauth_callback: Optional callback function invoked when reauth is needed
             tan_status_callback: Optional callback function invoked during TAN approval process
                                Called with (status, data) where status is 'requested', 'pending', 'approved', 'timeout'
@@ -134,6 +139,7 @@ class ComdirectClient:
         self.username = username
         self._password = password  # Private to avoid accidental logging
         self.base_url = base_url.rstrip("/")
+        self.swagger_spec_url = swagger_spec_url
         self.reauth_callback = reauth_callback
         self.tan_status_callback = tan_status_callback
         self.token_refresh_threshold = token_refresh_threshold_seconds
@@ -154,8 +160,12 @@ class ComdirectClient:
         self._refresh_lock = asyncio.Lock()
         self._refresh_task: Optional[asyncio.Task[None]] = None
 
-        # HTTP client
+        # HTTP client for auth (not for API calls - those go through Bravado)
         self._http_client = httpx.AsyncClient(timeout=timeout_seconds)
+
+        # Bravado client (initialized after authentication)
+        self._bravado_client: Optional[SwaggerClient] = None
+        self._bravado_http_client: Optional[ComdirectBravadoClient] = None
 
         logger.info("ComdirectClient initialized")
 
@@ -169,20 +179,79 @@ class ComdirectClient:
         logger.debug(f"Request ID: {request_id}")
         return request_id
 
-    def _get_request_info_header(self) -> str:
-        """Generate x-http-request-info header value."""
+    def _get_session_id(self) -> str:
+        """Get or generate session ID."""
         if not self._session_id:
             self._session_id = str(uuid.uuid4())
             logger.debug(f"Generated session ID: {sanitize_token(self._session_id)}")
+        return self._session_id
 
+    def _get_request_info_header(self) -> str:
+        """Generate x-http-request-info header value."""
         return json.dumps(
             {
                 "clientRequestId": {
-                    "sessionId": self._session_id,
+                    "sessionId": self._get_session_id(),
                     "requestId": self._generate_request_id(),
                 }
             }
         )
+
+    def _get_access_token(self) -> Optional[str]:
+        """Get current access token (for Bravado adapter)."""
+        return self._access_token
+
+    async def _initialize_bravado_client(self) -> None:
+        """Initialize the Bravado client with the Swagger spec."""
+        if self._bravado_client is not None:
+            return
+
+        logger.info("Initializing Bravado client from Swagger spec")
+
+        # Create custom HTTP client adapter
+        self._bravado_http_client = ComdirectBravadoClient(
+            get_access_token=self._get_access_token,
+            get_session_id=self._get_session_id,
+            generate_request_id=self._generate_request_id,
+        )
+
+        # Load Swagger spec and create client
+        try:
+            self._bravado_client = await asyncio.to_thread(
+                SwaggerClient.from_url,
+                self.swagger_spec_url,
+                http_client=self._bravado_http_client,
+                config={
+                    "validate_requests": False,  # Don't validate requests (Comdirect spec may have issues)
+                    "validate_responses": False,  # Don't validate responses
+                    "validate_swagger_spec": False,  # Don't validate spec
+                    "use_models": True,  # Use models for responses
+                },
+            )
+            logger.info("Bravado client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Bravado client: {e}")
+            raise
+
+    @property
+    def api(self) -> SwaggerClient:
+        """Access the Bravado-generated API client.
+
+        Returns:
+            SwaggerClient instance with all API endpoints
+
+        Raises:
+            RuntimeError: If client is not authenticated or Bravado client not initialized
+        """
+        if not self.is_authenticated():
+            raise RuntimeError(
+                "Client not authenticated. Call authenticate() first before accessing API."
+            )
+        if self._bravado_client is None:
+            raise RuntimeError(
+                "Bravado client not initialized. This should not happen - please report a bug."
+            )
+        return self._bravado_client
 
     async def authenticate(self) -> None:
         """Perform full authentication flow (Steps 1-5).
@@ -195,6 +264,7 @@ class ComdirectClient:
         5. Activates session
         6. Exchanges for secondary token with banking scope
         7. Starts automatic token refresh task
+        8. Initializes Bravado client
 
         Raises:
             AuthenticationError: If authentication fails
@@ -229,6 +299,9 @@ class ComdirectClient:
 
             # Start automatic token refresh task
             self._start_refresh_task()
+
+            # Initialize Bravado client
+            await self._initialize_bravado_client()
 
         except Exception as e:
             logger.error(f"Authentication failed: {e}")
@@ -720,6 +793,19 @@ class ComdirectClient:
                 self._token_expiry = token_expiry
                 logger.info(f"Tokens restored from storage (expires: {token_expiry.isoformat()})")
                 self._start_refresh_task()
+                # Initialize Bravado client if we have valid tokens
+                # Note: This creates a task but doesn't await it - it will initialize in background
+                if self.is_authenticated():
+                    try:
+                        # Try to initialize synchronously if we're in an event loop
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(self._initialize_bravado_client())
+                        else:
+                            loop.run_until_complete(self._initialize_bravado_client())
+                    except RuntimeError:
+                        # No event loop, will initialize on first authenticate() call
+                        pass
         except TokenStorageError as e:
             logger.warning(f"Failed to restore tokens from storage: {e}")
 
@@ -770,7 +856,9 @@ class ComdirectClient:
         """
         self.reauth_callback = callback
 
-    def register_tan_status_callback(self, callback: Callable[[str, dict[str, Any]], None]) -> None:
+    def register_tan_status_callback(
+        self, callback: Callable[[str, dict[str, Any]], None]
+    ) -> None:
         """Register a callback to be invoked during TAN approval process.
 
         Args:
@@ -794,237 +882,6 @@ class ComdirectClient:
                 logger.error(f"Error in TAN status callback: {e}")
         else:
             logger.debug(f"TAN status update: {status} - {data} (no callback registered)")
-
-    async def _ensure_authenticated(self) -> None:
-        """Ensure client has valid authentication token.
-
-        Raises:
-            TokenExpiredError: If token is expired and refresh fails
-        """
-        if not self.is_authenticated():
-            raise TokenExpiredError("Not authenticated")
-
-        # Check if token needs refresh
-        if self._token_expiry:
-            now = utc_now()
-            if now >= self._token_expiry:
-                logger.warning("Access token expired, attempting refresh")
-                success = await self.refresh_token()
-                if not success:
-                    raise TokenExpiredError("Token expired and refresh failed")
-
-    async def get_account_balances(
-        self, with_attributes: bool = True, without_attributes: Optional[str] = None
-    ) -> list[AccountBalance]:
-        """Retrieve account balances.
-
-        Args:
-            with_attributes: Include account master data (default: True)
-            without_attributes: Comma-separated list of attributes to exclude (optional)
-
-        Returns:
-            List of AccountBalance objects
-
-        Raises:
-            TokenExpiredError: If authentication token is expired
-            ValidationError: If request parameters are invalid (422)
-            ServerError: If API server returns 500 error
-            NetworkTimeoutError: If request times out
-        """
-        await self._ensure_authenticated()
-
-        logger.debug("Fetching account balances")
-
-        # Build query parameters
-        params: dict[str, str] = {}
-        if not with_attributes:
-            params["without-attr"] = "account"
-        if without_attributes:
-            if "without-attr" in params:
-                params["without-attr"] += f",{without_attributes}"
-            else:
-                params["without-attr"] = without_attributes
-
-        try:
-            response = await self._http_client.get(
-                f"{self.base_url}/api/banking/clients/user/v2/accounts/balances",
-                headers={
-                    "Authorization": f"Bearer {self._access_token}",
-                    "Accept": "application/json",
-                    "x-http-request-info": self._get_request_info_header(),
-                },
-                params=params if params else None,
-            )
-
-            if response.status_code == 401:
-                logger.warning("API request failed - token expired")
-                success = await self.refresh_token()
-                if not success:
-                    self._invoke_reauth_callback("api_request_unauthorized")
-                    raise TokenExpiredError("Token expired and refresh failed")
-                # Retry request with new token
-                return await self.get_account_balances(with_attributes, without_attributes)
-
-            if response.status_code == 422:
-                logger.error("Account balances request failed - validation error")
-                raise ValidationError("Invalid request parameters for account balances")
-
-            if response.status_code == 500:
-                logger.error("API server error during account balances request")
-                raise ServerError("API server returned 500 Internal Server Error")
-
-            response.raise_for_status()
-            data = response.json()
-
-            balances = [AccountBalance.from_dict(item) for item in data["values"]]
-            logger.info(f"Retrieved {len(balances)} account balances")
-            logger.debug(f"Parsed {len(balances)} account balance objects")
-
-            return balances
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during API request")
-            raise NetworkTimeoutError("Account balances request timed out") from e
-
-    async def get_transactions(
-        self,
-        account_id: str,
-        transaction_state: Optional[str] = None,
-        transaction_direction: Optional[str] = None,
-        paging_count: Optional[int] = None,
-        min_booking_date: Optional[date] = None,
-        max_booking_date: Optional[date] = None,
-        with_attributes: bool = True,
-        without_attributes: Optional[str] = None,
-    ) -> list[Transaction]:
-        """Retrieve transactions for a specific account with optional date filtering.
-
-        This method supports date filtering and pagination. By default, it fetches
-        up to 500 transactions (API limit). For accounts with more than 500 transactions,
-        use date filtering to retrieve additional transactions.
-
-        Args:
-            account_id: Account UUID (from AccountBalance.accountId)
-            transaction_state: Optional filter: "BOOKED", "NOTBOOKED", or "BOTH" (default: "BOTH")
-            transaction_direction: Optional filter: "CREDIT", "DEBIT", or "CREDIT_AND_DEBIT" (default: "CREDIT_AND_DEBIT")
-            paging_count: Optional number of results per page (default: 500, max: 500)
-            min_booking_date: Optional start date for filtering (YYYY-MM-DD format)
-            max_booking_date: Optional end date for filtering (YYYY-MM-DD format)
-            with_attributes: Include account details in response (default: True)
-            without_attributes: Comma-separated list of attributes to exclude (optional)
-
-        Returns:
-            List of Transaction objects (up to 500 per call)
-
-        Raises:
-            TokenExpiredError: If authentication token is expired
-            AccountNotFoundError: If account does not exist
-            ValidationError: If request parameters are invalid (422)
-            ServerError: If API server returns 500 error
-            NetworkTimeoutError: If request times out
-        """
-        await self._ensure_authenticated()
-
-        # Build query parameters
-        params: dict[str, str] = {}
-        if transaction_state:
-            params["transactionState"] = transaction_state
-        if transaction_direction:
-            params["transactionDirection"] = transaction_direction
-        if paging_count is not None:
-            params["paging-count"] = str(paging_count)
-        else:
-            # Default to maximum page size if not specified
-            params["paging-count"] = "500"
-        if min_booking_date:
-            # Format date as YYYY-MM-DD
-            params["min-bookingDate"] = min_booking_date.strftime("%Y-%m-%d")
-        if max_booking_date:
-            # Format date as YYYY-MM-DD
-            params["max-bookingDate"] = max_booking_date.strftime("%Y-%m-%d")
-        if not with_attributes:
-            params["without-attr"] = "account"
-        if without_attributes:
-            if "without-attr" in params:
-                params["without-attr"] += f",{without_attributes}"
-            else:
-                params["without-attr"] = without_attributes
-
-        log_msg = f"Fetching transactions for account {account_id[:8]}..."
-        if transaction_direction:
-            log_msg += f" (direction: {transaction_direction})"
-        if transaction_state:
-            log_msg += f" (state: {transaction_state})"
-        if min_booking_date:
-            log_msg += f" (from: {min_booking_date})"
-        if max_booking_date:
-            log_msg += f" (to: {max_booking_date})"
-        if paging_count is not None:
-            log_msg += f" (count: {paging_count})"
-        logger.debug(log_msg)
-
-        try:
-            response = await self._http_client.get(
-                f"{self.base_url}/api/banking/v1/accounts/{account_id}/transactions",
-                headers={
-                    "Authorization": f"Bearer {self._access_token}",
-                    "Accept": "application/json",
-                    "x-http-request-info": self._get_request_info_header(),
-                },
-                params=params,
-            )
-
-            if response.status_code == 401:
-                logger.warning("API request failed - token expired")
-                success = await self.refresh_token()
-                if not success:
-                    self._invoke_reauth_callback("api_request_unauthorized")
-                    raise TokenExpiredError("Token expired and refresh failed")
-                # Retry request with new token
-                return await self.get_transactions(
-                    account_id,
-                    transaction_state,
-                    transaction_direction,
-                    paging_count,
-                    min_booking_date,
-                    max_booking_date,
-                    with_attributes,
-                    without_attributes,
-                )
-
-            if response.status_code == 404:
-                logger.error(f"Account {account_id[:8]}... not found")
-                raise AccountNotFoundError(f"Account {account_id} not found")
-
-            if response.status_code == 422:
-                logger.error("Transactions request failed - validation error")
-                raise ValidationError("Invalid request parameters for transactions")
-
-            if response.status_code == 500:
-                logger.error("API server error during transactions request")
-                raise ServerError("API server returned 500 Internal Server Error")
-
-            response.raise_for_status()
-            data = response.json()
-
-            transactions = [Transaction.from_dict(item) for item in data["values"]]
-            logger.info(
-                f"Retrieved {len(transactions)} transactions for account {account_id[:8]}..."
-            )
-            logger.debug(f"Parsed {len(transactions)} transaction objects")
-
-            # Log pagination info for debugging
-            if "paging" in data:
-                paging_info = data["paging"]
-                logger.debug(
-                    f"Pagination: index={paging_info.get('index')}, matches={paging_info.get('matches')}"
-                )
-
-            return transactions
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during API request")
-            raise NetworkTimeoutError("Transactions request timed out") from e
 
     async def close(self) -> None:
         """Close the HTTP client and cleanup resources."""

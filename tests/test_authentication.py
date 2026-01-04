@@ -45,12 +45,7 @@ class TestLibraryInterface:
         assert hasattr(client, "authenticate")
         assert callable(getattr(client, "authenticate"))
 
-        assert hasattr(client, "get_account_balances")
-        assert callable(getattr(client, "get_account_balances"))
-
-        assert hasattr(client, "get_transactions")
-        assert callable(getattr(client, "get_transactions"))
-
+        assert hasattr(client, "api")
         assert hasattr(client, "refresh_token")
         assert callable(getattr(client, "refresh_token"))
 

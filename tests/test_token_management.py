@@ -123,33 +123,6 @@ class TestTokenRefresh:
         # Callback should be invoked
         assert len(callback_called) > 0
 
-    @pytest.mark.asyncio
-    async def test_expired_token_raises_error(self, mock_httpx_client):
-        """Test that requests with expired token raise TokenExpiredError."""
-        with patch("comdirect_client.client.httpx.AsyncClient", return_value=mock_httpx_client):
-            client = ComdirectClient(
-                client_id="test_id",
-                client_secret="test_secret",
-                username="test_user",
-                password="test_pass",
-            )
-            client._http_client = mock_httpx_client
-            client._access_token = "test_access_token"
-            client._token_expiry = utc_now() - timedelta(seconds=10)  # Already expired
-            client._session_id = "test_session_id"
-
-            response = Mock()
-            response.status_code = 401
-            response.raise_for_status = Mock(
-                side_effect=httpx.HTTPStatusError("401", request=Mock(), response=response)
-            )
-
-            mock_httpx_client.get = AsyncMock(return_value=response)
-            mock_httpx_client.post = AsyncMock(return_value=response)
-
-            # Request with expired token should raise TokenExpiredError
-            with pytest.raises(TokenExpiredError):
-                await client.get_account_balances()
 
 
 class TestReauthCallback:

@@ -5,7 +5,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A modern, asynchronous Python client library for the Comdirect Banking API. Built with type safety, automatic token refresh, and comprehensive error handling.
+A modern, asynchronous Python client library for the Comdirect Banking API. This library handles authentication and session management, while using [Bravado](https://github.com/Yelp/bravado) to automatically generate API methods from the official Comdirect Swagger specification.
 
 > **Note**: This code is AI-generated but has been thoroughly manually tested and reviewed.
 
@@ -14,11 +14,11 @@ A modern, asynchronous Python client library for the Comdirect Banking API. Buil
 - ✅ **Full OAuth2 + TAN Authentication Flow** - Handles all 5 authentication steps automatically
 - ✅ **Automatic Token Refresh** - Background task refreshes tokens 120s before expiration
 - ✅ **Optional Token Persistence** - Save/restore tokens to disk to avoid reauthentication after app restart
-- ✅ **Type-Safe Models** - Strongly typed dataclasses for all API responses
-- ✅ **Async/Await** - Built on `httpx` and `asyncio` for high performance
+- ✅ **Bravado Integration** - Auto-generated API methods from Swagger spec (all endpoints available)
+- ✅ **Type-Safe Models** - Bravado generates strongly typed models from the API specification
+- ✅ **Async/Await** - Built on `httpx`, `asyncio`, and `bravado-asyncio` for high performance
 - ✅ **Comprehensive Logging** - Detailed logging with sensitive data sanitization
 - ✅ **Reauth Callbacks** - Custom callbacks when reauthentication is needed
-- ✅ **Error Handling** - Specific exceptions for different failure scenarios
 - ✅ **Context Manager Support** - Automatic resource cleanup
 
 ## API Documentation References
@@ -38,8 +38,7 @@ This client implements the official Comdirect REST API:
 - [Quick Start](#quick-start)
 - [API Reference](#api-reference)
   - [Authentication](#authentication)
-  - [Account Balances](#account-balances)
-  - [Transactions](#transactions)
+  - [Using the Bravado API Client](#using-the-bravado-api-client)
 - [Token Management](#token-management)
   - [Automatic Token Refresh](#automatic-token-refresh)
   - [Token Persistence](#token-persistence)
@@ -60,8 +59,8 @@ This client implements the official Comdirect REST API:
 comdirect-lib/
 ├── comdirect_client/           # Main package
 │   ├── __init__.py             # Package exports
-│   ├── client.py               # ComdirectClient implementation
-│   ├── models.py               # Data models (AccountBalance, Transaction)
+│   ├── client.py               # ComdirectClient with auth and Bravado integration
+│   ├── bravado_adapter.py      # Custom HTTP client adapter for Bravado
 │   ├── exceptions.py           # Custom exceptions
 │   └── token_storage.py        # Token persistence
 │
@@ -70,11 +69,10 @@ comdirect-lib/
 │
 ├── tests/
 │   ├── conftest.py             # Pytest fixtures and mocking setup
-│   ├── test_comdirect_bdd.py   # BDD step definitions (pytest-bdd)
-│   └── test_token_storage.py   # Token persistence tests (19 test cases)
+│   ├── test_authentication.py  # Authentication flow tests
+│   ├── test_token_management.py # Token refresh and management tests
+│   └── test_token_storage.py   # Token persistence tests
 │
-├── comdirect_api.feature       # Gherkin BDD specification (39 scenarios, 457 lines)
-├── COMDIRECT_API.md            # Detailed API documentation (815 lines)
 ├── pyproject.toml              # Poetry dependencies and configuration
 ├── test.sh                     # Quick integration test script
 ├── .env.example                # Environment variable template
@@ -83,12 +81,11 @@ comdirect-lib/
 
 ### Key Components
 
-- **`client.py`**: Core API client with OAuth2 flow, token refresh, and API methods
-- **`models.py`**: Type-safe dataclasses (`AccountBalance`, `Transaction`, `AmountValue`)
+- **`client.py`**: Core API client with OAuth2 flow, token refresh, and Bravado client initialization
+- **`bravado_adapter.py`**: Custom HTTP client adapter that injects Comdirect authentication headers
 - **`exceptions.py`**: Specific exception types for different failure scenarios
 - **`token_storage.py`**: Token persistence for avoiding reauthentication after restart
-- **`comdirect_api.feature`**: Comprehensive BDD specification (living documentation)
-- **`COMDIRECT_API.md`**: Deep dive into Comdirect API endpoints and flows
+- **Bravado**: Automatically generates API methods and models from the Swagger specification
 
 ---
 
@@ -307,23 +304,35 @@ async def main():
         await client.authenticate()
         print("✓ Authenticated!")
         
+        # Use Bravado-generated API methods
         # Fetch account balances
-        balances = await client.get_account_balances()
+        balances_response = await client.api.banking.clients.user.v2.accounts.balances.get(
+            user="user"
+        ).result()
+        balances = balances_response.values
+        
         print(f"\nFound {len(balances)} accounts:")
         for balance in balances:
-            print(f"  {balance.account_display_id}: {balance.balance.value} {balance.balance.unit}")
+            account = balance.account
+            print(f"  {account.accountDisplayId}: {balance.balance.value} {balance.balance.unit}")
          
-         # Fetch all transactions for first account (up to 500 most recent)
-         if balances:
-             transactions = await client.get_transactions(
-                 account_id=balances[0].accountId
-             )
-             print(f"\nFound {len(transactions)} transactions:")
-             for tx in transactions[:5]:  # Show first 5
-                 # Use booking date if available, otherwise fall back to valuta date
-                 display_date = tx.bookingDate if tx.bookingDate else tx.valutaDate
-                 print(f"  {display_date}: {tx.amount.value} {tx.amount.unit}")
-
+        # Fetch transactions for first account
+        if balances:
+            account_id = balances[0].accountId
+            transactions_response = await client.api.banking.v1.accounts.transactions.get(
+                accountId=account_id,
+                transactionState="BOOKED",
+                paging_count=500
+            ).result()
+            transactions = transactions_response.values
+            
+            print(f"\nFound {len(transactions)} transactions:")
+            for tx in transactions[:5]:  # Show first 5
+                # Use booking date if available, otherwise fall back to valuta date
+                display_date = tx.bookingDate.date if tx.bookingDate else tx.valutaDate
+                amount = tx.amount.value if tx.amount else "N/A"
+                unit = tx.amount.unit if tx.amount else ""
+                print(f"  {display_date}: {amount} {unit}")
 
 
 if __name__ == "__main__":
@@ -380,8 +389,10 @@ client = ComdirectClient(
     username: str,                      # Comdirect username (required)
     password: str,                      # Comdirect password (required)
     base_url: str = "https://api.comdirect.de",  # API base URL
+    swagger_spec_url: str = "https://kunde.comdirect.de/cms/media/comdirect_rest_api_swagger.json",  # Swagger spec URL
     token_storage_path: Optional[str] = None,    # File path for token persistence
     reauth_callback: Optional[Callable[[str], None]] = None,  # Called when reauth needed
+    tan_status_callback: Optional[Callable[[str, dict], None]] = None,  # Called during TAN approval
     token_refresh_threshold_seconds: int = 120,  # Refresh 120s before expiry
     timeout_seconds: float = 30.0,     # HTTP request timeout
 )
@@ -455,377 +466,121 @@ else:
 
 ---
 
-### Account Balances
+### Using the Bravado API Client
 
-#### `get_account_balances()`
+After authentication, access all Comdirect API endpoints via the `api` property, which provides Bravado-generated methods from the Swagger specification.
 
-Retrieve balances for all accounts:
+#### Accessing the API Client
 
 ```python
-from comdirect_client.models import AccountBalance
+# After authenticating
+await client.authenticate()
 
-balances: list[AccountBalance] = await client.get_account_balances()
+# Access the Bravado-generated API client
+api = client.api
+```
+
+#### Example: Fetching Account Balances
+
+```python
+# Get account balances
+balances_response = await client.api.banking.clients.user.v2.accounts.balances.get(
+    user="user"
+).result()
+
+# Access the values
+balances = balances_response.values
 
 for balance in balances:
-    print(f"Account ID: {balance.accountId}")                    # UUID
-    print(f"Display ID: {balance.account_display_id}")          # Formatted account number
-    print(f"Type: {balance.account_type}")                      # GIRO, DEPOT, FESTGELD, etc.
-    print(f"Balance: {balance.balance.value} {balance.balance.unit}")  # Current balance
-    print(f"Available: {balance.available_cash_amount.value}")  # Available cash
-    print(f"Date: {balance.balanceDate}")                       # ISO date
-    print()
+    print(f"Account ID: {balance.accountId}")
+    print(f"Display ID: {balance.account.accountDisplayId}")
+    print(f"Balance: {balance.balance.value} {balance.balance.unit}")
+    print(f"Available: {balance.availableCashAmount.value} {balance.availableCashAmount.unit}")
 ```
 
-**Method Signature:**
+**With Query Parameters:**
 
 ```python
-async def get_account_balances(
-    with_attributes: bool = True,
-    without_attributes: Optional[str] = None
-) -> list[AccountBalance]
-```
-
-**Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `with_attributes` | `bool` | `True` | Include account master data in response |
-| `without_attributes` | `Optional[str]` | `None` | Comma-separated list of attributes to exclude (e.g., `"account"`) |
-
-**Query Parameter Examples:**
-
-```python
-# Include all attributes (default)
-balances = await client.get_account_balances()
-
 # Exclude account master data
-balances = await client.get_account_balances(with_attributes=False)
-
-# Custom exclusion
-balances = await client.get_account_balances(
-    without_attributes="balance,currency"
-)
+balances_response = await client.api.banking.clients.user.v2.accounts.balances.get(
+    user="user",
+    without_attr="account"
+).result()
 ```
 
-**Response Fields:**
-
-- `accountId` (str) - Account UUID (use for `get_transactions()`)
-- `account_display_id` (str) - Formatted account number (e.g., "DE12345...")
-- `account_type` (str) - Account type: `GIRO`, `DEPOT`, `FESTGELD`, `CALL_MONEY`, etc.
-- `balance` (AmountValue) - Current balance with currency
-- `available_cash_amount` (AmountValue) - Available funds
-- `balanceDate` (str) - Balance date (ISO format)
-
-**Errors:**
-
-- `TokenExpiredError` - Authentication expired
-- `NetworkTimeoutError` - Request timed out
-
----
-
-### Transactions
-
-#### `get_transactions()`
-
-Retrieve **all available** transactions for a specific account (up to 500 per call):
+#### Example: Fetching Transactions
 
 ```python
-from comdirect_client.models import Transaction
+# Get transactions for an account
+transactions_response = await client.api.banking.v1.accounts.transactions.get(
+    accountId="account-uuid-here",
+    transactionState="BOOKED",
+    transactionDirection="CREDIT_AND_DEBIT",
+    paging_count=500
+).result()
 
-transactions: list[Transaction] = await client.get_transactions(
-    account_id="account-uuid-here",                   # Required: Account UUID
-    transaction_state="BOOKED",                       # Optional: Filter by state
-    transaction_direction="CREDIT_AND_DEBIT",         # Optional: Filter by direction
-)
+transactions = transactions_response.values
 
 for tx in transactions:
     # Use booking date if available, otherwise fall back to valuta date
-    display_date = tx.bookingDate if tx.bookingDate else tx.valutaDate
-    print(f"Date: {display_date}")                 # Booking date or valuta date
-    print(f"Amount: {tx.amount.value} {tx.amount.unit}")  # Transaction amount
-    if tx.transactionType:
-        print(f"Type: {tx.transactionType.text}")  # Transaction type description
-    # Remittance information is parsed into structured lines
-    print("Remittance lines:")
-    for line in tx.remittance_lines:
-        print(f"  - {line}")
-    print()
-```
-
-**Method Signature:**
-
-```python
-async def get_transactions(
-    account_id: str,
-    transaction_state: Optional[str] = None,
-    transaction_direction: Optional[str] = None,
-    paging_count: Optional[int] = None,
-    min_booking_date: Optional[date] = None,
-    max_booking_date: Optional[date] = None,
-    with_attributes: bool = True,
-    without_attributes: Optional[str] = None
-) -> list[Transaction]
-```
-
-**Parameters:**
-
-| Parameter | Type | Values | Default | Description |
-|-----------|------|--------|---------|-------------|
-| `account_id` | `str` | UUID | **Required** | Account UUID from `AccountBalance.accountId` |
-| `transaction_state` | `Optional[str]` | `"BOOKED"`, `"NOTBOOKED"`, `"BOTH"` | `None` | Filter by booking state |
-| `transaction_direction` | `Optional[str]` | `"CREDIT"`, `"DEBIT"`, `"CREDIT_AND_DEBIT"` | `None` | Filter by direction |
-| `paging_count` | `Optional[int]` | 1-500 | `500` | Number of results per page (max: 500) |
-| `min_booking_date` | `Optional[date]` | `date` object | `None` | Start date for filtering (YYYY-MM-DD) |
-| `max_booking_date` | `Optional[date]` | `date` object | `None` | End date for filtering (YYYY-MM-DD) |
-| `with_attributes` | `bool` | - | `True` | Include account details in response |
-| `without_attributes` | `Optional[str]` | attribute names | `None` | Comma-separated attributes to exclude |
-
-**Transaction States:**
-
-- `BOOKED` - Only confirmed/booked transactions
-- `NOTBOOKED` - Only pending/unbooked transactions
-- `BOTH` - All transactions (booked + pending)
-
-**Transaction Directions:**
-
-- `CREDIT` - Only incoming transactions (deposits)
-- `DEBIT` - Only outgoing transactions (withdrawals)
-- `CREDIT_AND_DEBIT` - Both incoming and outgoing
-
-**📅 Date Filtering:**
-
-The library supports server-side date filtering using `min_booking_date` and `max_booking_date` parameters:
-
-```python
-from datetime import date
-
-# Fetch transactions for a specific date range
-transactions = await client.get_transactions(
-    account_id="...",
-    min_booking_date=date(2024, 1, 1),
-    max_booking_date=date(2024, 12, 31)
-)
-print(f"Retrieved {len(transactions)} transactions for 2024")
-```
-
-**📄 Pagination:**
-
-The library supports pagination via the `paging_count` parameter:
-
-- **Default page size**: `paging_count` defaults to **500** (API maximum)
-- **Library behavior**: By default, `get_transactions()` fetches up to 500 transactions in one call
-
-```python
-# Fetch up to 500 most recent transactions (default)
-transactions = await client.get_transactions(account_id="...")
-print(f"Retrieved {len(transactions)} transactions (up to 500)")
-
-# Fetch with custom page size
-transactions = await client.get_transactions(
-    account_id="...",
-    paging_count=100
-)
-```
-
-**Response Fields:**
-
-- `bookingDate` (Optional[date]) - Booking date - **May be None for pending transactions**
-- `valutaDate` (str) - Value date (ISO format string) - Use as fallback if `bookingDate` is not available
-- `amount` (Optional[AmountValue]) - Transaction amount (positive for credit, negative for debit)
-- `transactionType` (Optional[EnumText]) - Transaction type with `key` and `text` fields
-- `remittance_lines` (property) - List of parsed remittance lines (property that returns `remittanceLines`)
-- `remittanceLines` (list[str]) - Parsed remittance lines extracted from the raw `remittanceInfo` field
-- `creditor` (Optional[AccountInformation]) - Creditor account information
-- `debtor` (Optional[AccountInformation]) - Debtor account information
-- `directDebitCreditorId` (Optional[str]) - Direct debit creditor identifier
-- `directDebitMandateId` (Optional[str]) - Direct debit mandate reference
-
-**💡 Tip: Handle Missing Booking Dates**
-
-For pending transactions, `bookingDate` may be `None`. Always use `valutaDate` as a fallback:
-
-```python
-# Recommended pattern
-for tx in transactions:
-    # Use booking date if available, otherwise fall back to valuta date
-    display_date = tx.bookingDate if tx.bookingDate else tx.valutaDate
+    display_date = tx.bookingDate.date if tx.bookingDate else tx.valutaDate
     print(f"Date: {display_date}")
+    if tx.amount:
+        print(f"Amount: {tx.amount.value} {tx.amount.unit}")
+    if tx.transactionType:
+        print(f"Type: {tx.transactionType.text}")
+    if tx.remittanceInfo:
+        print(f"Remittance: {tx.remittanceInfo}")
 ```
 
-**⚠️ Important: Date Filtering NOT Supported**
-
-The Comdirect API does **not support** `from_date`/`to_date` parameters for banking transactions. To filter by date, retrieve all transactions and filter client-side:
+**With Date Filtering:**
 
 ```python
-from datetime import datetime, timedelta
-
-# Fetch all transactions
-all_transactions = await client.get_transactions(account_id="...")
-
-# Filter client-side for last 30 days (using booking_date or valuta_date as fallback)
-cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-recent = [tx for tx in all_transactions if (tx.booking_date or tx.valuta_date or "") >= cutoff_date]
-
-print(f"Found {len(recent)} transactions in last 30 days")
+# Fetch transactions for a date range
+transactions_response = await client.api.banking.v1.accounts.transactions.get(
+    accountId="account-uuid-here",
+    min_bookingDate="2024-01-01",
+    max_bookingDate="2024-12-31",
+    paging_count=500
+).result()
 ```
 
----
+#### Available API Endpoints
 
-### Advanced: Pagination and API Limits
+All endpoints from the [Comdirect Swagger specification](https://kunde.comdirect.de/cms/media/comdirect_rest_api_swagger.json) are available via `client.api.*`. The API structure follows the Swagger spec paths:
 
-The Comdirect API uses server-side pagination with a hard limit of 500 transactions per request.
+- **Banking**: `client.api.banking.*`
+  - Account balances: `client.api.banking.clients.user.v2.accounts.balances.get()`
+  - Transactions: `client.api.banking.v1.accounts.transactions.get()`
+- **Brokerage**: `client.api.brokerage.*`
+- **Messages**: `client.api.messages.*`
+- **Reports**: `client.api.reports.*`
+- **Session**: `client.api.session.*`
 
-**Key points:**
+#### Important Notes
 
-- Default page size is 500 transactions (API maximum).
-- The library's `get_transactions()` method defaults to `paging-count=500` to maximize results in a single call.
-- You cannot retrieve more than 500 transactions for an account in one request.
-- Use date filtering (`min_booking_date`/`max_booking_date`) to retrieve transactions across different time periods.
+1. **Always call `.result()`**: Bravado-asyncio operations return futures that must be awaited via `.result()`
+2. **Response Structure**: Responses follow the Swagger spec structure. Most list endpoints return a response with a `values` property containing the actual data
+3. **Type Safety**: Bravado generates type-safe models from the Swagger spec
+4. **Error Handling**: Bravado raises its own exceptions (e.g., `HTTPError`). You may want to catch and convert them to your custom exceptions if needed
 
-To access more than 500 transactions, use date-based filtering to split your queries across multiple date ranges (see examples below).
-
-#### Fetching More Than 500 Transactions
-
-⚠️ **Important:** The comdirect API has a hard limit of 500 transactions per request. To retrieve more than 500 transactions, use date-based filtering to split your queries across multiple date ranges.
-
-**Strategy 1: Use Native Date Filtering**
-
-The library now supports native date filtering via `min_booking_date` and `max_booking_date` parameters. Use this to fetch transactions across multiple date ranges:
+#### Example: Error Handling
 
 ```python
-from datetime import date, timedelta
-from typing import List
+from bravado.exception import HTTPError
 
-async def fetch_all_transactions_by_date(
-    client, 
-    account_uuid: str,
-    start_date: date,
-    end_date: date,
-    chunk_days: int = 30
-) -> List[Transaction]:
-    """
-    Fetch transactions across multiple date ranges to bypass the 500 limit.
-    
-    Strategy: Break large date ranges into smaller chunks (e.g., 30-day periods)
-    and use native date filtering.
-    """
-    all_transactions = []
-    current_date = start_date
-    
-    while current_date <= end_date:
-        # Calculate date range (e.g., 30-day chunks)
-        chunk_end = min(current_date + timedelta(days=chunk_days), end_date)
-        
-        print(f"Fetching transactions from {current_date} to {chunk_end}")
-        
-        # Fetch transactions for this date range using native date filtering
-        transactions = await client.get_transactions(
-            account_id=account_uuid,
-            min_booking_date=current_date,
-            max_booking_date=chunk_end,
-            paging_count=500  # Maximum per request
-        )
-        
-        all_transactions.extend(transactions)
-        print(f"  Found {len(transactions)} transactions in this period")
-        
-        # Move to next chunk
-        current_date = chunk_end + timedelta(days=1)
-    
-    # Remove duplicates (in case of overlapping date ranges)
-    seen_refs = set()
-    unique_transactions = []
-    for tx in all_transactions:
-        # Use bookingDate if available, otherwise valutaDate as fallback
-        date_key = tx.bookingDate if tx.bookingDate else tx.valutaDate
-        ref = (date_key, tx.amount.value if tx.amount else None, tx.reference)
-        if ref not in seen_refs:
-            seen_refs.add(ref)
-            unique_transactions.append(tx)
-    
-    return unique_transactions
-
-# Usage example:
-transactions = await fetch_all_transactions_by_date(
-    client,
-    account_uuid="YOUR_ACCOUNT_UUID",
-    start_date=date(2024, 1, 1),
-    end_date=date(2024, 12, 31),
-    chunk_days=30  # Fetch in 30-day chunks
-)
-print(f"Total transactions retrieved: {len(transactions)}")
+try:
+    response = await client.api.banking.v1.accounts.transactions.get(
+        accountId="invalid-uuid"
+    ).result()
+except HTTPError as e:
+    if e.status_code == 404:
+        print("Account not found")
+    elif e.status_code == 422:
+        print("Invalid request parameters")
+    else:
+        print(f"API error: {e}")
 ```
-
-**Strategy 2: Historical Data Export (Recommended for Large Datasets)**
-
-If you need transaction history beyond what the API provides:
-
-1. **Use Comdirect's Web Interface**: Log in to comdirect.de and export transactions as CSV/PDF for historical analysis
-2. **Combine API + Historical Data**: 
-   - Use the API for recent transactions (last 500)
-   - Use exported CSV files for older historical data
-3. **Regular Polling**: Set up a scheduled job to fetch and store transactions daily/weekly, building your own historical database
-
-```python
-import sqlite3
-from datetime import datetime, timedelta
-
-async def poll_and_store_transactions(client, account_uuid: str, db_path: str):
-    """
-    Fetch recent transactions and store them in a local database.
-    Run this daily to build a complete transaction history.
-    """
-    # Fetch up to 500 most recent transactions
-    transactions = await client.get_transactions(account_uuid)
-    
-    # Store in SQLite database
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    
-    # Create table if not exists
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            booking_date TEXT,
-            valuta_date TEXT,
-            amount REAL,
-            currency TEXT,
-            reference TEXT,
-            remittance_info TEXT,
-            creditor_name TEXT,
-            PRIMARY KEY (booking_date, valuta_date, amount, reference)
-        )
-    """)
-    
-    # Insert new transactions (ignore duplicates)
-    for tx in transactions:
-        cursor.execute("""
-            INSERT OR IGNORE INTO transactions 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(tx.bookingDate) if tx.bookingDate else None,
-            tx.valutaDate,
-            float(tx.amount.value) if tx.amount else None,
-            tx.amount.unit if tx.amount else None,
-            tx.reference,
-            " | ".join(tx.remittance_lines) if tx.remittance_lines else None,
-            tx.creditor.holderName if tx.creditor else None
-        ))
-    
-    conn.commit()
-    conn.close()
-    print(f"Stored {len(transactions)} transactions (duplicates ignored)")
-
-# Run daily via cron job or scheduler
-await poll_and_store_transactions(client, account_uuid, "transactions.db")
-```
-
-**Key Takeaways:**
-
-- ✅ **For most use cases**: Use `get_transactions()` to fetch up to 500 transactions
-- ✅ **For >500 transactions**: Use date-based filtering (`min_booking_date`/`max_booking_date`) with multiple API calls
-- ✅ **For specific date ranges**: Use native date filtering parameters
-- ✅ **For historical analysis**: Implement regular polling and store transactions locally
-- ⚠️ **Note**: The API has a hard limit of 500 transactions per request, so use date filtering to retrieve larger datasets
 
 ---
 
@@ -932,7 +687,9 @@ Tokens are stored as JSON with ISO format datetime:
 # Scenario 1: Tokens exist and are valid
 async with ComdirectClient(..., token_storage_path="...") as client:
     await client.authenticate()  # Returns immediately, no 2FA needed!
-    balances = await client.get_account_balances()
+    balances_response = await client.api.banking.clients.user.v2.accounts.balances.get(
+        user="user"
+    ).result()
 
 # Scenario 2: Tokens expired, need reauthentication
 async with ComdirectClient(..., token_storage_path="...") as client:
@@ -1074,13 +831,19 @@ async def get_balances():
     """Use the persistent client for API calls."""
     if not client:
         raise RuntimeError("Client not initialized")
-    return await client.get_account_balances()
+    response = await client.api.banking.clients.user.v2.accounts.balances.get(
+        user="user"
+    ).result()
+    return response.values
 
 async def get_transactions(account_id: str):
     """Another API call using the same client instance."""
     if not client:
         raise RuntimeError("Client not initialized")
-    return await client.get_transactions(account_id)
+    response = await client.api.banking.v1.accounts.transactions.get(
+        accountId=account_id
+    ).result()
+    return response.values
 
 async def shutdown():
     """Clean up when application shuts down."""
@@ -1111,7 +874,10 @@ client = ComdirectClient(
 
 if client.is_authenticated():
     print("Tokens restored from storage - ready to use!")
-    balances = await client.get_account_balances()
+    balances_response = await client.api.banking.clients.user.v2.accounts.balances.get(
+        user="user"
+    ).result()
+    balances = balances_response.values
 else:
     print("No valid tokens - TAN approval required")
     await client.authenticate()
@@ -1126,7 +892,10 @@ else:
 async def get_balance_bad():
     async with ComdirectClient(...) as client:
         await client.authenticate()  # TAN approval needed
-        return await client.get_account_balances()
+        response = await client.api.banking.clients.user.v2.accounts.balances.get(
+            user="user"
+        ).result()
+        return response.values
     # Client destroyed here! Refresh task cancelled!
 
 # After ~10 minutes, calling get_balance_bad() again requires new TAN approval
@@ -1159,7 +928,10 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/balances")
 async def get_balances():
-    return await client.get_account_balances()
+    response = await client.api.banking.clients.user.v2.accounts.balances.get(
+        user="user"
+    ).result()
+    return response.values
 ```
 
 **Long-running Service:**
@@ -1177,8 +949,12 @@ async def main():
     
     # Run indefinitely - tokens refresh automatically
     while True:
-        balances = await client.get_account_balances()
-        print(f"Current balance: {balances[0].balance.value}")
+        balances_response = await client.api.banking.clients.user.v2.accounts.balances.get(
+            user="user"
+        ).result()
+        balances = balances_response.values
+        if balances:
+            print(f"Current balance: {balances[0].balance.value} {balances[0].balance.unit}")
         await asyncio.sleep(3600)  # Check every hour
 
 asyncio.run(main())
@@ -1188,85 +964,74 @@ asyncio.run(main())
 
 ## Data Models
 
-All API responses are parsed into type-safe dataclasses defined in `comdirect_client.models`:
+All API responses use **Bravado-generated models** from the Swagger specification. These models are automatically generated and provide type safety based on the official API schema.
 
-### AccountBalance
+### Accessing Model Properties
 
-```python
-from dataclasses import dataclass
-from comdirect_client.models import AccountBalance, AmountValue
+Bravado models follow the Swagger specification structure. Here are some common patterns:
 
-@dataclass
-class AccountBalance:
-    accountId: str                      # Account UUID (use for get_transactions)
-    account_display_id: str             # Formatted account number
-    account_type: str                   # Account type (GIRO, DEPOT, etc.)
-    balance: AmountValue                # Current balance
-    available_cash_amount: AmountValue  # Available cash
-    balanceDate: str                    # Balance date (ISO format)
-```
-
-**Example:**
+**Account Balance Example:**
 
 ```python
-balance = balances[0]
-print(balance.accountId)           # "B5A9F0C8-B421-..."
-print(balance.account_display_id)  # "DE12 3456 7890 1234 5678 90"
-print(balance.account_type)        # "GIRO"
-print(balance.balance.value)       # 1234.56
-print(balance.balance.unit)        # "EUR"
+balances_response = await client.api.banking.clients.user.v2.accounts.balances.get(
+    user="user"
+).result()
+
+for balance in balances_response.values:
+    # Access nested account object
+    account = balance.account
+    print(f"Account ID: {balance.accountId}")
+    print(f"Display ID: {account.accountDisplayId}")
+    print(f"Type: {account.accountType.text}")
+    
+    # Access amount values
+    print(f"Balance: {balance.balance.value} {balance.balance.unit}")
+    print(f"Available: {balance.availableCashAmount.value} {balance.availableCashAmount.unit}")
 ```
 
-### Transaction
+**Transaction Example:**
 
 ```python
-@dataclass
-class Transaction:
-    bookingDate: Optional[date]         # Booking date, may be None for pending transactions
-    valutaDate: str                     # Value date (ISO format string)
-    amount: Optional[AmountValue]       # Transaction amount
-    transactionType: Optional[EnumText] # Transaction type with key and text
-    remittanceLines: list[str]          # Parsed remittance lines
-    creditor: Optional[AccountInformation]  # Creditor account information
-    debtor: Optional[AccountInformation]    # Debtor account information
-    directDebitCreditorId: Optional[str]     # Direct debit creditor identifier
-    directDebitMandateId: Optional[str]      # Direct debit mandate reference
-    # ... and more fields
+transactions_response = await client.api.banking.v1.accounts.transactions.get(
+    accountId="account-uuid"
+).result()
 
-    @property
-    def remittance_lines(self) -> list[str]:
-        """Convenience property that returns remittanceLines."""
-        return self.remittanceLines
+for tx in transactions_response.values:
+    # Date handling (bookingDate may be None for pending transactions)
+    if tx.bookingDate:
+        date_obj = tx.bookingDate.date  # Access date property
+    else:
+        date_str = tx.valutaDate  # Fallback to valutaDate string
+    
+    # Amount (may be None)
+    if tx.amount:
+        print(f"Amount: {tx.amount.value} {tx.amount.unit}")
+    
+    # Transaction type
+    if tx.transactionType:
+        print(f"Type: {tx.transactionType.text}")
+    
+    # Remittance info (raw string from API)
+    if tx.remittanceInfo:
+        print(f"Remittance: {tx.remittanceInfo}")
+    
+    # Account information
+    if tx.creditor:
+        print(f"Creditor: {tx.creditor.holderName}")
+    if tx.debtor:
+        print(f"Debtor: {tx.debtor.holderName}")
 ```
 
-**Example:**
+### Model Structure
 
-```python
-tx = transactions[0]
-print(tx.bookingDate)     # date(2024, 11, 9) or None
-print(tx.valutaDate)      # "2024-11-09"
-print(tx.amount.value)     # -12.50 (negative = debit)
-print(tx.amount.unit)      # "EUR"
-if tx.transactionType:
-    print(tx.transactionType.text)  # "DIRECT_DEBIT"
-print(tx.remittance_lines) # ["SPC*Mandragora Bochum", "Order 123-4567890-1234567"]
-```
+Bravado models are generated from the Swagger spec, so they match the API documentation exactly. Key points:
 
-### AmountValue
+- **Nested Objects**: Access nested properties directly (e.g., `balance.account.accountDisplayId`)
+- **Optional Fields**: Many fields may be `None` - always check before accessing
+- **Date Fields**: Some date fields are objects with a `.date` property, others are strings
+- **Amount Values**: Amount fields have `.value` (string) and `.unit` (string) properties
 
-```python
-@dataclass
-class AmountValue:
-    value: float    # Numeric value
-    unit: str       # Currency code (EUR, USD, etc.)
-```
-
-**Example:**
-
-```python
-amount = balance.balance
-print(f"{amount.value} {amount.unit}")  # "1234.56 EUR"
-```
+For the complete model structure, refer to the [Comdirect Swagger specification](https://kunde.comdirect.de/cms/media/comdirect_rest_api_swagger.json).
 
 ---
 
