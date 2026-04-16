@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from comdirect_client.client import ComdirectClient
@@ -120,7 +120,7 @@ async def main():
             if expiry:
                 logger.info(f"Token expires at: {expiry.strftime('%Y-%m-%d %H:%M:%S')}")
                 logger.info(
-                    f"Token valid for: {(expiry - datetime.now()).total_seconds():.0f} seconds"
+                    f"Token valid for: {(expiry - datetime.now(timezone.utc)).total_seconds():.0f} seconds"
                 )
         else:
             try:
@@ -135,7 +135,7 @@ async def main():
                 if expiry:
                     logger.info(f"Token expires at: {expiry.strftime('%Y-%m-%d %H:%M:%S')}")
                     logger.info(
-                        f"Token valid for: {(expiry - datetime.now()).total_seconds():.0f} seconds"
+                        f"Token valid for: {(expiry - datetime.now(timezone.utc)).total_seconds():.0f} seconds"
                     )
 
             except Exception as e:

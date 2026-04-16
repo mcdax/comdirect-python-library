@@ -1,10 +1,8 @@
 """API operation tests - account balances and transactions."""
 
-import json
 import logging
 from datetime import date
 from decimal import Decimal
-from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
@@ -12,43 +10,6 @@ import pytest
 
 from comdirect_client.client import ComdirectClient
 from comdirect_client.exceptions import AccountNotFoundError, ValidationError, ServerError
-
-
-def write_transactions_to_json(transactions, filename="transactions.json"):
-    """Write transactions to a JSON file.
-
-    Args:
-        transactions: List of transaction objects
-        filename: Output JSON filename
-    """
-    output_path = Path(filename)
-
-    # Convert transactions to JSON-serializable format
-    transactions_data = []
-    for tx in transactions:
-        tx_dict = {
-            "bookingStatus": tx.bookingStatus,
-            "reference": tx.reference,
-            "valutaDate": str(tx.valutaDate) if tx.valutaDate else None,
-            "newTransaction": tx.newTransaction,
-            "bookingDate": str(tx.bookingDate) if tx.bookingDate else None,
-            "remittanceLines": tx.remittance_lines,  # Parsed lines with markers stripped
-            "amount": {
-                "value": str(tx.amount.value) if tx.amount else None,
-                "unit": tx.amount.unit if tx.amount else None,
-            },
-            "transactionType": tx.transactionType,
-            "remitter": tx.remitter,
-            "debtor": tx.debtor,
-            "creditor": tx.creditor,
-        }
-        transactions_data.append(tx_dict)
-
-    # Write to JSON file
-    with open(output_path, "w") as f:
-        json.dump(transactions_data, f, indent=2, default=str)
-
-    print(f"Wrote {len(transactions_data)} transactions to {output_path}")
 
 
 @pytest.fixture
@@ -228,9 +189,6 @@ class TestTransactionRetrieval:
         # Call method
         transactions = await authenticated_client.get_transactions("test_account_id")
 
-        # Write transactions to JSON file
-        write_transactions_to_json(transactions, "transactions.json")
-
         # Verify
         assert len(transactions) == 1
         assert transactions[0].bookingStatus == "BOOKED"
@@ -407,9 +365,6 @@ class TestTransactionRetrieval:
 
         # Should not raise an exception
         transactions = await authenticated_client.get_transactions("test_account_id")
-
-        # Write transactions to JSON file
-        write_transactions_to_json(transactions, "transactions_with_nulls.json")
 
         assert len(transactions) == 1
         assert transactions[0].amount is None

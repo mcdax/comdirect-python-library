@@ -208,49 +208,11 @@ class TestTransactionModel:
         assert transaction.debtor.holderName == "John Doe"
         assert transaction.debtor.iban == "DE89370400440532013000"
 
-    def test_transaction_with_deptor_fallback(self):
-        """Test Transaction parsing with Swagger typo deptor field."""
-        data = {
-            "bookingStatus": "BOOKED",
-            "reference": "Test reference",
-            "valutaDate": "2024-01-15",
-            "newTransaction": False,
-            "deptor": {
-                "holderName": "Jane Doe",
-                "iban": "DE89370400440532013001",
-            },
-        }
-        transaction = Transaction.from_dict(data)
-
-        # Should fallback to deptor
-        assert transaction.debtor is not None
-        assert transaction.debtor.holderName == "Jane Doe"
-        assert transaction.debtor.iban == "DE89370400440532013001"
-
-    def test_transaction_prefers_debtor_over_deptor(self):
-        """Test Transaction prefers debtor over deptor when both present."""
-        data = {
-            "bookingStatus": "BOOKED",
-            "reference": "Test reference",
-            "valutaDate": "2024-01-15",
-            "newTransaction": False,
-            "debtor": {
-                "holderName": "John Doe (correct)",
-                "iban": "DE89370400440532013000",
-            },
-            "deptor": {
-                "holderName": "Jane Doe (wrong)",
-                "iban": "DE89370400440532013001",
-            },
-        }
-        transaction = Transaction.from_dict(data)
-
-        # Should prefer debtor
-        assert transaction.debtor.holderName == "John Doe (correct)"
-        assert transaction.debtor.iban == "DE89370400440532013000"
-
     def test_transaction_with_remittance_info(self):
-        """Test Transaction remittance lines parsing."""
+        """Test Transaction remittance lines parsing (smoke test).
+
+        Full parser coverage lives in ``test_remittance_info.py``.
+        """
         data = {
             "bookingStatus": "BOOKED",
             "reference": "Test reference",

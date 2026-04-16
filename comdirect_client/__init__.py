@@ -1,37 +1,40 @@
-"""Comdirect API Client Library.
+"""Async Python client for the comdirect banking API.
 
-Async Python client for the Comdirect Banking API with automatic token refresh.
+The public surface is intentionally narrow: instantiate ``ComdirectClient``,
+authenticate once (triggers push-TAN), then call ``get_account_balances`` or
+``get_transactions``. See the module docstring on ``ComdirectClient`` for the
+recommended lifecycle.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from comdirect_client.client import ComdirectClient
 from comdirect_client.exceptions import (
-    ComdirectAPIError,
-    AuthenticationError,
-    TANTimeoutError,
-    SessionActivationError,
-    TokenExpiredError,
-    NetworkTimeoutError,
     AccountNotFoundError,
-    ValidationError,
+    AuthenticationError,
+    ComdirectAPIError,
+    NetworkTimeoutError,
     ServerError,
+    SessionActivationError,
+    TANTimeoutError,
+    TokenExpiredError,
+    ValidationError,
 )
 from comdirect_client.models import (
-    AccountBalance,
     Account,
-    Transaction,
+    AccountBalance,
+    AccountInformation,
     AmountValue,
     EnumText,
-    AccountInformation,
+    Transaction,
 )
-from comdirect_client.token_storage import (
-    TokenPersistence,
-    TokenStorageError,
-)
+from comdirect_client.remittance import ParsedRemittance, parse as parse_remittance_info
+from comdirect_client.token_storage import TokenPersistence, TokenStorageError
 
 __all__ = [
+    # Client
     "ComdirectClient",
+    # Exceptions
     "ComdirectAPIError",
     "AuthenticationError",
     "TANTimeoutError",
@@ -41,12 +44,17 @@ __all__ = [
     "AccountNotFoundError",
     "ValidationError",
     "ServerError",
+    # Token persistence
     "TokenPersistence",
     "TokenStorageError",
+    # Models
     "AccountBalance",
     "Account",
     "Transaction",
     "AmountValue",
     "EnumText",
     "AccountInformation",
+    # Remittance parsing
+    "ParsedRemittance",
+    "parse_remittance_info",
 ]

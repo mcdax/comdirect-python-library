@@ -44,7 +44,7 @@ class TestTokenPersistence:
     def test_init_nonexistent_parent(self):
         """Test TokenPersistence with nonexistent parent directory."""
         invalid_path = "/nonexistent/directory/tokens.json"
-        with pytest.raises(TokenStorageError, match="Storage directory does not exist"):
+        with pytest.raises(TokenStorageError, match="Token storage directory does not exist"):
             TokenPersistence(storage_path=invalid_path)
 
     def test_save_and_load_tokens(self, storage_path):
@@ -108,7 +108,7 @@ class TestTokenPersistence:
         Path(storage_path).write_text(json.dumps(data))
 
         persistence = TokenPersistence(storage_path=storage_path)
-        with pytest.raises(TokenStorageError, match="Invalid token file format"):
+        with pytest.raises(TokenStorageError, match="is missing fields"):
             persistence.load_tokens()
 
     def test_load_invalid_datetime(self, storage_path):
@@ -286,8 +286,10 @@ class TestTokenPersistenceIntegration:
         # Verify file exists
         assert Path(temp_token_file).exists()
 
-        # Clear storage
-        client._clear_token_storage()
+        # Clearing tokens in memory must also clear the persisted file.
+        client._clear_tokens()
 
-        # Verify file is deleted
+        # Verify file is deleted and memory is cleared
         assert not Path(temp_token_file).exists()
+        assert client._access_token is None
+        assert client._refresh_token is None

@@ -1,99 +1,61 @@
-"""Main Comdirect API client implementation."""
+"""The public ``ComdirectClient`` facade.
+
+This class holds mutable session state (tokens, session id, HTTP client),
+runs the background token-refresh loop, and delegates actual work to the
+stateless helpers in :mod:`comdirect_client.http_api` and
+:mod:`comdirect_client.auth_flow`. Keep it small and glue-like; any code
+that is tempted to grow here should go into one of those modules instead.
+
+Persistent client pattern
+-------------------------
+
+Create the client once at application startup and reuse it. The background
+refresh task will keep the tokens fresh so you never pay a second TAN
+approval inside a single process lifetime::
+
+    async with ComdirectClient(...) as client:
+        if not client.is_authenticated():
+            await client.authenticate()
+        balances = await client.get_account_balances()
+        transactions = await client.get_transactions(balances[0].accountId)
+
+If you pass ``token_storage_path``, tokens persist across restarts and the
+first ``authenticate()`` after a restart typically only needs a refresh
+(no TAN prompt) — provided the refresh token is still valid.
+"""
 
 import asyncio
-import json
 import logging
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional, cast
+from typing import Any, Awaitable, Callable, Optional, Union
 
 import httpx
 
-from comdirect_client.exceptions import (
-    AccountNotFoundError,
-    AuthenticationError,
-    NetworkTimeoutError,
-    ServerError,
-    SessionActivationError,
-    TANTimeoutError,
-    TokenExpiredError,
-    ValidationError,
+from comdirect_client import http_api
+from comdirect_client.auth_flow import (
+    AuthResult,
+    TanStatusCallback,
+    perform_authentication,
 )
+from comdirect_client.exceptions import TokenExpiredError
 from comdirect_client.models import AccountBalance, Transaction
 from comdirect_client.token_storage import TokenPersistence, TokenStorageError
 
 logger = logging.getLogger(__name__)
 
 
-def utc_now() -> datetime:
-    """Get current UTC time as timezone-aware datetime."""
+def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def sanitize_token(token: str, prefix_length: int = 8) -> str:
-    """Sanitize a token for logging by showing only the prefix."""
-    if not token or len(token) <= prefix_length:
-        return "***"
-    return f"{token[:prefix_length]}..."
+ReauthCallback = Callable[[str], Union[None, Awaitable[None]]]
 
 
 class ComdirectClient:
-    """Async client for the Comdirect Banking API.
+    """Async client for the comdirect banking API.
 
-    This client handles:
-    - OAuth2 + TAN authentication flow
-    - Automatic token refresh via asyncio
-    - Account balance and transaction retrieval
-    - Reauth callback on token expiration
-    - Comprehensive logging with sensitive data sanitization
-
-    IMPORTANT - Persistent Client Usage:
-        This client should be kept alive (persistent) throughout your application's
-        lifecycle for best functionality. The client runs a background asyncio task
-        that automatically refreshes tokens 120 seconds before they expire.
-
-        If you destroy the client instance after each operation:
-        - The background refresh task is cancelled
-        - Tokens will expire after ~10 minutes
-        - A new TAN approval will be required for each session
-
-        Best practice:
-        - Create the client once at application startup
-        - Reuse the same instance for all API calls
-        - Use token_storage_path to persist tokens across application restarts
-        - When tokens are loaded from storage, the refresh task starts automatically
-
-    Example (recommended - persistent client):
-        ```python
-        # Create once at startup
-        client = ComdirectClient(
-            client_id="...",
-            client_secret="...",
-            username="...",
-            password="...",
-            token_storage_path="/path/to/tokens.json",
-        )
-
-        # Reuse for all operations
-        await client.authenticate()  # TAN approval once
-        balances = await client.get_account_balances()  # Uses same session
-        transactions = await client.get_transactions(...)  # Still same session
-
-        # Token auto-refreshes in background - no new TAN needed!
-        ```
-
-    Example (NOT recommended - new client per operation):
-        ```python
-        # DON'T DO THIS - requires TAN approval every ~10 minutes
-        async def get_balance():
-            async with ComdirectClient(...) as client:
-                await client.authenticate()  # TAN approval needed
-                return await client.get_account_balances()
-            # Client destroyed, refresh task cancelled!
-
-        # Next call after token expires requires new TAN
-        ```
+    See the module docstring for the recommended usage pattern.
     """
 
     def __init__(
@@ -103,788 +65,158 @@ class ComdirectClient:
         username: str,
         password: str,
         base_url: str = "https://api.comdirect.de",
-        reauth_callback: Optional[Callable[[str], None]] = None,
-        tan_status_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        reauth_callback: Optional[ReauthCallback] = None,
+        tan_status_callback: Optional[TanStatusCallback] = None,
         token_refresh_threshold_seconds: int = 120,
         timeout_seconds: float = 30.0,
         token_storage_path: Optional[str] = None,
-    ):
-        """Initialize the Comdirect API client.
-
-        Args:
-            client_id: OAuth2 client ID from Comdirect Developer Portal
-            client_secret: OAuth2 client secret
-            username: Comdirect account username
-            password: Comdirect account password
-            base_url: API base URL (default: production API)
-            reauth_callback: Optional callback function invoked when reauth is needed
-            tan_status_callback: Optional callback function invoked during TAN approval process
-                               Called with (status, data) where status is 'requested', 'pending', 'approved', 'timeout'
-            token_refresh_threshold_seconds: Seconds before expiry to trigger refresh (default: 120)
-            timeout_seconds: HTTP request timeout in seconds (default: 30.0)
-            token_storage_path: Optional file path to persist tokens for session recovery.
-                               Enables loading saved tokens on client restart.
-                               Parent directory must exist.
-
-        Raises:
-            TokenStorageError: If token_storage_path directory doesn't exist
-        """
+    ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.username = username
-        self._password = password  # Private to avoid accidental logging
+        self._password = password  # underscored to reduce accidental log leakage
         self.base_url = base_url.rstrip("/")
         self.reauth_callback = reauth_callback
         self.tan_status_callback = tan_status_callback
         self.token_refresh_threshold = token_refresh_threshold_seconds
         self.timeout_seconds = timeout_seconds
 
-        # Token persistence
-        try:
-            self._token_storage = TokenPersistence(token_storage_path)
-        except TokenStorageError as e:
-            logger.error(f"Failed to initialize token storage: {e}")
-            raise
+        self._token_storage = TokenPersistence(token_storage_path)
 
-        # State management
-        self._session_id: Optional[str] = None
+        # Mutable state protected by the refresh lock. The attribute names
+        # (``_access_token``, ``_refresh_token``, ``_token_expiry``,
+        # ``_session_id``, ``_http_client``) are intentionally stable — tests
+        # set them directly to simulate an authenticated client.
+        self._session_id: str = str(uuid.uuid4())
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
         self._refresh_lock = asyncio.Lock()
         self._refresh_task: Optional[asyncio.Task[None]] = None
 
-        # HTTP client
         self._http_client = httpx.AsyncClient(timeout=timeout_seconds)
-
         logger.info("ComdirectClient initialized")
 
-        # Attempt to restore tokens from storage
-        self._restore_tokens_from_storage()
+        self._try_restore_tokens()
 
-    def _generate_request_id(self) -> str:
-        """Generate a 9-digit request ID from current timestamp."""
-        timestamp = str(int(time.time() * 1000))  # Milliseconds
-        request_id = timestamp[-9:]  # Last 9 digits
-        logger.debug(f"Request ID: {request_id}")
-        return request_id
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
 
-    def _get_request_info_header(self) -> str:
-        """Generate x-http-request-info header value."""
-        if not self._session_id:
-            self._session_id = str(uuid.uuid4())
-            logger.debug(f"Generated session ID: {sanitize_token(self._session_id)}")
+    async def __aenter__(self) -> "ComdirectClient":
+        return self
 
-        return json.dumps(
-            {
-                "clientRequestId": {
-                    "sessionId": self._session_id,
-                    "requestId": self._generate_request_id(),
-                }
-            }
-        )
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """Cancel the background refresh task and close the HTTP client."""
+        await self._stop_refresh_task()
+        await self._http_client.aclose()
+        logger.info("ComdirectClient closed")
+
+    # ------------------------------------------------------------------
+    # Authentication state
+    # ------------------------------------------------------------------
+
+    def is_authenticated(self) -> bool:
+        """Return True if we have tokens loaded — even expired ones.
+
+        The refresh token may still be valid, so this method is deliberately
+        lenient. Use ``get_token_expiry`` to decide whether a refresh is
+        imminent.
+        """
+        return self._access_token is not None and self._token_expiry is not None
+
+    def get_token_expiry(self) -> Optional[datetime]:
+        """Return the current access token's expiry as a UTC-aware datetime."""
+        return self._token_expiry
+
+    def register_reauth_callback(self, callback: ReauthCallback) -> None:
+        """Register (or replace) the reauth callback."""
+        self.reauth_callback = callback
+
+    def register_tan_status_callback(self, callback: TanStatusCallback) -> None:
+        """Register (or replace) the TAN status callback."""
+        self.tan_status_callback = callback
+
+    # ------------------------------------------------------------------
+    # Step 1-5 orchestration
+    # ------------------------------------------------------------------
 
     async def authenticate(self) -> None:
-        """Perform full authentication flow (Steps 1-5).
-
-        This method:
-        1. Obtains OAuth2 password credentials token
-        2. Retrieves session status
-        3. Creates TAN challenge
-        4. Polls for TAN approval (60 second timeout)
-        5. Activates session
-        6. Exchanges for secondary token with banking scope
-        7. Starts automatic token refresh task
-
-        Raises:
-            AuthenticationError: If authentication fails
-            TANTimeoutError: If TAN approval times out
-            SessionActivationError: If session activation fails
-        """
+        """Run the full 5-step auth flow (TAN required)."""
         logger.info("Starting authentication flow")
-        logger.info("Reason: Initial authentication required (no valid tokens available)")
-
         try:
-            # Step 1: OAuth2 Password Credentials
-            initial_token = await self._step1_password_credentials()
-
-            # Step 2: Get Session UUID
-            session_uuid = await self._step2_session_status(initial_token)
-
-            # Step 3: Create TAN Challenge
-            tan_challenge_id, tan_type, tan_poll_url = await self._step3_tan_challenge(
-                initial_token, session_uuid
+            result = await perform_authentication(
+                self._http_client,
+                self.base_url,
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                username=self.username,
+                password=self._password,
+                session_id=self._session_id,
+                tan_status_callback=self.tan_status_callback,
             )
-
-            # Step 4: Poll for TAN Approval
-            await self._step4_poll_tan_approval(initial_token, tan_poll_url, tan_type)
-
-            # Step 4b: Activate Session
-            await self._step4b_activate_session(initial_token, session_uuid, tan_challenge_id)
-
-            # Step 5: Secondary Token Exchange
-            await self._step5_secondary_token(initial_token)
-
-            logger.info("Authentication successful")
-
-            # Start automatic token refresh task
-            self._start_refresh_task()
-
-        except Exception as e:
-            logger.error(f"Authentication failed: {e}")
+        except Exception:
             self._clear_tokens()
             raise
 
-    async def _step1_password_credentials(self) -> str:
-        """Step 1: OAuth2 Resource Owner Password Credentials Grant.
-
-        Returns:
-            Access token with TWO_FACTOR scope
-
-        Raises:
-            AuthenticationError: If credentials are invalid
-        """
-        logger.debug("Step 1: Obtaining OAuth2 password credentials token")
-
-        try:
-            response = await self._http_client.post(
-                f"{self.base_url}/oauth/token",
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data={
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "grant_type": "password",
-                    "username": self.username,
-                    "password": self._password,
-                },
-            )
-
-            if response.status_code == 401:
-                logger.error("Authentication failed - Invalid credentials")
-                raise AuthenticationError("Invalid credentials")
-
-            response.raise_for_status()
-            data = response.json()
-
-            access_token = data["access_token"]
-            logger.info(f"OAuth2 token obtained: {sanitize_token(access_token)}")
-            return cast(str, access_token)
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during authentication")
-            raise NetworkTimeoutError("Authentication request timed out") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error during authentication: {e.response.status_code}")
-            raise AuthenticationError(f"Authentication failed: {e}") from e
-
-    async def _step2_session_status(self, access_token: str) -> str:
-        """Step 2: Retrieve session UUID.
-
-        Args:
-            access_token: Access token from Step 1
-
-        Returns:
-            Session UUID identifier
-
-        Raises:
-            AuthenticationError: If session retrieval fails
-        """
-        logger.debug("Step 2: Retrieving session status")
-
-        try:
-            response = await self._http_client.get(
-                f"{self.base_url}/api/session/clients/user/v1/sessions",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Accept": "application/json",
-                    "x-http-request-info": self._get_request_info_header(),
-                },
-            )
-
-            response.raise_for_status()
-            data = response.json()
-
-            if not data or not isinstance(data, list) or len(data) == 0:
-                raise AuthenticationError("No session data returned")
-
-            session_uuid = data[0]["identifier"]
-            logger.info(f"Session UUID retrieved: {sanitize_token(session_uuid)}")
-            return cast(str, session_uuid)
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during session retrieval")
-            raise NetworkTimeoutError("Session retrieval timed out") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error during session retrieval: {e.response.status_code}")
-            raise AuthenticationError(f"Session retrieval failed: {e}") from e
-
-    async def _step3_tan_challenge(
-        self, access_token: str, session_uuid: str
-    ) -> tuple[str, str, str]:
-        """Step 3: Create TAN challenge.
-
-        Args:
-            access_token: Access token from Step 1
-            session_uuid: Session UUID from Step 2
-
-        Returns:
-            Tuple of (challenge_id, tan_type, poll_url)
-
-        Raises:
-            AuthenticationError: If TAN challenge creation fails
-        """
-        logger.debug("Step 3: Creating TAN challenge")
-
-        try:
-            response = await self._http_client.post(
-                f"{self.base_url}/api/session/clients/user/v1/sessions/{session_uuid}/validate",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "x-http-request-info": self._get_request_info_header(),
-                },
-                json={
-                    "identifier": session_uuid,
-                    "sessionTanActive": True,
-                    "activated2FA": True,
-                },
-            )
-
-            response.raise_for_status()
-
-            # Parse x-once-authentication-info header
-            auth_info_header = response.headers.get("x-once-authentication-info")
-            if not auth_info_header:
-                raise AuthenticationError("Missing x-once-authentication-info header")
-
-            auth_info = json.loads(auth_info_header)
-            challenge_id = auth_info["id"]
-            tan_type = auth_info["typ"]
-            poll_url = auth_info["link"]["href"]
-
-            logger.info(f"TAN challenge created - Type: {tan_type}, ID: {challenge_id}")
-            logger.warning(f"TAN approval required - Method: {tan_type}, Timeout: 60 seconds")
-
-            # Notify that TAN has been requested
-            self._invoke_tan_status_callback(
-                "requested",
-                {"tan_type": tan_type, "challenge_id": challenge_id, "timeout_seconds": 60},
-            )
-
-            return challenge_id, tan_type, poll_url
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during TAN challenge creation")
-            raise NetworkTimeoutError("TAN challenge creation timed out") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error during TAN challenge creation: {e.response.status_code}")
-            raise AuthenticationError(f"TAN challenge creation failed: {e}") from e
-
-    async def _step4_poll_tan_approval(
-        self, access_token: str, poll_url: str, tan_type: str
-    ) -> None:
-        """Step 4: Poll for TAN approval.
-
-        Args:
-            access_token: Access token from Step 1
-            poll_url: Polling URL from Step 3
-            tan_type: TAN type (P_TAN_PUSH, P_TAN, M_TAN)
-
-        Raises:
-            TANTimeoutError: If TAN approval times out after 60 seconds
-        """
-        logger.info(f"Step 4: Waiting for TAN approval ({tan_type})")
-
-        start_time = time.time()
-        timeout = 60  # 60 seconds timeout
-        poll_interval = 1  # 1 second between polls
-
-        # Notify that TAN approval is pending
-        self._invoke_tan_status_callback(
-            "pending", {"tan_type": tan_type, "timeout_seconds": timeout, "elapsed_seconds": 0}
-        )
-
-        while time.time() - start_time < timeout:
-            await asyncio.sleep(poll_interval)
-            elapsed = int(time.time() - start_time)
-            remaining = timeout - elapsed
-            logger.debug(f"Polling TAN status (elapsed: {elapsed}s, remaining: {remaining}s)")
-
-            try:
-                response = await self._http_client.get(
-                    f"{self.base_url}{poll_url}",
-                    headers={
-                        "Authorization": f"Bearer {access_token}",
-                        "Accept": "application/json",
-                        "x-http-request-info": self._get_request_info_header(),
-                    },
-                )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    status = data.get("status")
-
-                    if status == "AUTHENTICATED":
-                        logger.info(f"TAN approved via {tan_type}")
-                        self._invoke_tan_status_callback(
-                            "approved", {"tan_type": tan_type, "elapsed_seconds": elapsed}
-                        )
-                        return
-                    elif status == "PENDING":
-                        if elapsed % 10 == 0 and elapsed > 0:  # Log every 10 seconds
-                            logger.info(f"Still waiting for TAN approval ({elapsed}s elapsed)")
-                            self._invoke_tan_status_callback(
-                                "pending",
-                                {
-                                    "tan_type": tan_type,
-                                    "timeout_seconds": timeout,
-                                    "elapsed_seconds": elapsed,
-                                    "remaining_seconds": remaining,
-                                },
-                            )
-                        logger.debug("TAN approval pending, continuing poll")
-                        continue
-                    else:
-                        logger.error(f"Unexpected TAN status: {status}")
-                        raise AuthenticationError(f"Unexpected TAN status: {status}")
-                else:
-                    logger.warning(f"Poll returned status {response.status_code}, retrying")
-
-            except httpx.TimeoutException:
-                logger.warning("Poll request timed out, retrying")
-                continue
-
-        # Timeout reached
-        logger.error(f"TAN approval timeout - No approval received after {timeout} seconds")
-        self._invoke_tan_status_callback(
-            "timeout", {"tan_type": tan_type, "timeout_seconds": timeout}
-        )
-        raise TANTimeoutError("TAN approval timed out after 60 seconds")
-
-    async def _step4b_activate_session(
-        self, access_token: str, session_uuid: str, challenge_id: str
-    ) -> None:
-        """Step 4b: Activate session after TAN approval.
-
-        Args:
-            access_token: Access token from Step 1
-            session_uuid: Session UUID from Step 2
-            challenge_id: TAN challenge ID from Step 3
-
-        Raises:
-            SessionActivationError: If session activation fails
-        """
-        logger.debug("Step 4b: Activating session")
-
-        try:
-            response = await self._http_client.patch(
-                f"{self.base_url}/api/session/clients/user/v1/sessions/{session_uuid}",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "x-http-request-info": self._get_request_info_header(),
-                    "x-once-authentication-info": json.dumps({"id": challenge_id}),
-                },
-                json={
-                    "identifier": session_uuid,
-                    "sessionTanActive": True,
-                    "activated2FA": True,
-                },
-            )
-
-            if response.status_code == 422:
-                logger.error("Session activation failed - Incorrect header format")
-                raise SessionActivationError("Session activation failed: incorrect header format")
-
-            response.raise_for_status()
-            logger.info("Session activated successfully")
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during session activation")
-            raise NetworkTimeoutError("Session activation timed out") from e
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 422:
-                logger.error("Session activation failed - Incorrect header format")
-                raise SessionActivationError(f"Session activation failed: {e}") from e
-            logger.error(f"HTTP error during session activation: {e.response.status_code}")
-            raise SessionActivationError(f"Session activation failed: {e}") from e
-
-    async def _step5_secondary_token(self, initial_token: str) -> None:
-        """Step 5: Exchange for secondary token with banking scope.
-
-        Args:
-            initial_token: Access token from Step 1
-
-        Raises:
-            AuthenticationError: If token exchange fails
-        """
-        logger.debug("Step 5: Exchanging for secondary token")
-
-        try:
-            response = await self._http_client.post(
-                f"{self.base_url}/oauth/token",
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data={
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "grant_type": "cd_secondary",
-                    "token": initial_token,
-                },
-            )
-
-            response.raise_for_status()
-            data = response.json()
-
-            self._access_token = data["access_token"]
-            self._refresh_token = data["refresh_token"]
-            expires_in = data["expires_in"]
-
-            self._token_expiry = utc_now() + timedelta(seconds=expires_in)
-
-            logger.info(
-                f"Secondary token obtained: {sanitize_token(self._access_token or '')}, "
-                f"expires in {expires_in}s"
-            )
-
-            # Save tokens to persistent storage
-            self._save_tokens_to_storage()
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during token exchange")
-            raise NetworkTimeoutError("Token exchange timed out") from e
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error during token exchange: {e.response.status_code}")
-            raise AuthenticationError(f"Token exchange failed: {e}") from e
+        self._store_auth_result(result)
+        self._start_refresh_task()
+        logger.info("Authentication successful")
 
     async def refresh_token(self) -> bool:
-        """Refresh the access token using the refresh token.
-
-        Returns:
-            True if refresh succeeded, False otherwise
-
-        Raises:
-            TokenExpiredError: If refresh token is expired
-        """
+        """Refresh the access + refresh tokens. Returns True on success."""
         if not self._refresh_token:
             logger.error("No refresh token available")
             return False
 
         async with self._refresh_lock:
-            logger.debug("Acquiring token refresh lock")
             logger.info("Refreshing token")
-
-            try:
-                response = await self._http_client.post(
-                    f"{self.base_url}/oauth/token",
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                    data={
-                        "client_id": self.client_id,
-                        "client_secret": self.client_secret,
-                        "grant_type": "refresh_token",
-                        "refresh_token": self._refresh_token,
-                    },
-                )
-
-                if response.status_code == 401:
-                    logger.warning("Token refresh failed - token expired")
-                    self._invoke_reauth_callback("token_refresh_failed")
-                    return False
-
-                response.raise_for_status()
-                data = response.json()
-
-                self._access_token = data["access_token"]
-                self._refresh_token = data["refresh_token"]
-                expires_in = data["expires_in"]
-
-                self._token_expiry = utc_now() + timedelta(seconds=expires_in)
-
-                logger.info(f"Token refreshed, expires in {expires_in}s")
-                logger.debug("Token refresh lock released")
-
-                # Save tokens to persistent storage
-                self._save_tokens_to_storage()
-
-                return True
-
-            except httpx.TimeoutException:
-                logger.error("Network timeout during token refresh")
+            data = await http_api.oauth_refresh(
+                self._http_client,
+                self.base_url,
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                refresh_token=self._refresh_token,
+            )
+            if data is None:
+                await self._invoke_reauth_callback("token_refresh_failed")
                 return False
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP error during token refresh: {e.response.status_code}")
-                return False
-
-    def _start_refresh_task(self) -> None:
-        """Start the background token refresh task."""
-        if self._refresh_task and not self._refresh_task.done():
-            self._refresh_task.cancel()
-
-        self._refresh_task = asyncio.create_task(self._token_refresh_loop())
-        logger.info("Token refresh task started")
-
-    async def _token_refresh_loop(self) -> None:
-        """Background task that automatically refreshes tokens before expiration."""
-        while True:
-            try:
-                if not self._token_expiry:
-                    await asyncio.sleep(10)
-                    continue
-
-                # Calculate time until refresh needed
-                now = utc_now()
-                refresh_time = self._token_expiry - timedelta(seconds=self.token_refresh_threshold)
-                sleep_duration = (refresh_time - now).total_seconds()
-
-                if sleep_duration > 0:
-                    logger.debug(f"Next token refresh in {sleep_duration:.0f}s")
-                    await asyncio.sleep(sleep_duration)
-                else:
-                    # Token is already expired or near expiry, refresh immediately
-                    logger.info(
-                        f"Token already expired or near expiry (by {-sleep_duration:.0f}s), refreshing immediately"
-                    )
-
-                # Refresh token
-                logger.info(
-                    f"Auto-refreshing token ({self.token_refresh_threshold}s before expiry)"
+            self._store_auth_result(
+                AuthResult(
+                    access_token=data["access_token"],
+                    refresh_token=data["refresh_token"],
+                    expires_in=int(data["expires_in"]),
                 )
-                success = await self.refresh_token()
+            )
+            logger.info("Token refreshed, expires in %ds", data["expires_in"])
+            return True
 
-                if not success:
-                    logger.error("Automatic token refresh failed")
-                    self._invoke_reauth_callback("automatic_refresh_failed")
-                    break
-
-            except asyncio.CancelledError:
-                logger.info("Token refresh task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in token refresh loop: {e}")
-                await asyncio.sleep(10)
-
-    def _invoke_reauth_callback(self, reason: str) -> None:
-        """Invoke the reauth callback if registered.
-
-        Args:
-            reason: Reason for requiring reauth
-        """
-        self._clear_tokens()
-
-        logger.warning(
-            f"Reauthentication required - Reason: {reason}, Action: Call authenticate() again"
-        )
-
-        if self.reauth_callback:
-            logger.info(f"Invoking reauth callback - Reason: {reason}")
-            try:
-                self.reauth_callback(reason)
-            except Exception as e:
-                logger.error(f"Error in reauth callback: {e}")
-        else:
-            logger.warning("Reauth required but no callback registered")
-
-    def _clear_tokens(self) -> None:
-        """Clear all stored tokens and stop refresh task."""
-        self._access_token = None
-        self._refresh_token = None
-        self._token_expiry = None
-
-        if self._refresh_task and not self._refresh_task.done():
-            self._refresh_task.cancel()
-
-        logger.debug("Tokens cleared")
-
-    def _restore_tokens_from_storage(self) -> None:
-        """Restore tokens from persistent storage if available.
-
-        If token storage is configured and valid tokens exist in storage,
-        loads them into memory and starts the refresh task.
-        """
-        try:
-            tokens = self._token_storage.load_tokens()
-            if tokens:
-                access_token, refresh_token, token_expiry = tokens
-                self._access_token = access_token
-                self._refresh_token = refresh_token
-                self._token_expiry = token_expiry
-                logger.info(f"Tokens restored from storage (expires: {token_expiry.isoformat()})")
-                self._start_refresh_task()
-        except TokenStorageError as e:
-            logger.warning(f"Failed to restore tokens from storage: {e}")
-
-    def _save_tokens_to_storage(self) -> None:
-        """Save current tokens to persistent storage if configured."""
-        if self._access_token and self._refresh_token and self._token_expiry:
-            try:
-                self._token_storage.save_tokens(
-                    self._access_token, self._refresh_token, self._token_expiry
-                )
-            except TokenStorageError as e:
-                logger.warning(f"Failed to save tokens to storage: {e}")
-
-    def _clear_token_storage(self) -> None:
-        """Clear token storage (useful for logout)."""
-        try:
-            self._token_storage.clear_tokens()
-        except Exception as e:
-            logger.warning(f"Failed to clear token storage: {e}")
-
-    def is_authenticated(self) -> bool:
-        """Check if the client is currently authenticated.
-
-        Returns:
-            True if authenticated with valid token, False otherwise
-        """
-        result = self._access_token is not None and self._token_expiry is not None
-        logger.debug(
-            f"is_authenticated() check: access_token={'present' if self._access_token else 'None'}, "
-            f"token_expiry={'present' if self._token_expiry else 'None'}, "
-            f"result={result}"
-        )
-        return result
-
-    def get_token_expiry(self) -> Optional[datetime]:
-        """Get the token expiry datetime.
-
-        Returns:
-            Token expiry datetime or None if not authenticated
-        """
-        return self._token_expiry
-
-    def register_reauth_callback(self, callback: Callable[[str], None]) -> None:
-        """Register a callback to be invoked when reauth is required.
-
-        Args:
-            callback: Function to call with error message when reauth is needed
-        """
-        self.reauth_callback = callback
-
-    def register_tan_status_callback(self, callback: Callable[[str, dict[str, Any]], None]) -> None:
-        """Register a callback to be invoked during TAN approval process.
-
-        Args:
-            callback: Function to call with (status, data) during TAN approval.
-                     Status values: 'requested', 'pending', 'approved', 'timeout'
-                     Data dict contains additional info like tan_type, elapsed_seconds, etc.
-        """
-        self.tan_status_callback = callback
-
-    def _invoke_tan_status_callback(self, status: str, data: dict[str, Any]) -> None:
-        """Invoke the TAN status callback if registered.
-
-        Args:
-            status: TAN status ('requested', 'pending', 'approved', 'timeout')
-            data: Additional data about the TAN process
-        """
-        if self.tan_status_callback:
-            try:
-                self.tan_status_callback(status, data)
-            except Exception as e:
-                logger.error(f"Error in TAN status callback: {e}")
-        else:
-            logger.debug(f"TAN status update: {status} - {data} (no callback registered)")
-
-    async def _ensure_authenticated(self) -> None:
-        """Ensure client has valid authentication token.
-
-        Raises:
-            TokenExpiredError: If token is expired and refresh fails
-        """
-        if not self.is_authenticated():
-            raise TokenExpiredError("Not authenticated")
-
-        # Check if token needs refresh
-        if self._token_expiry:
-            now = utc_now()
-            if now >= self._token_expiry:
-                logger.warning("Access token expired, attempting refresh")
-                success = await self.refresh_token()
-                if not success:
-                    raise TokenExpiredError("Token expired and refresh failed")
+    # ------------------------------------------------------------------
+    # Banking endpoints
+    # ------------------------------------------------------------------
 
     async def get_account_balances(
-        self, with_attributes: bool = True, without_attributes: Optional[str] = None
+        self,
+        with_attributes: bool = True,
+        without_attributes: Optional[str] = None,
     ) -> list[AccountBalance]:
-        """Retrieve account balances.
+        """Return all account balances for the logged-in customer."""
+        await self._ensure_fresh_token()
+        params = _build_without_attr_params(with_attributes, without_attributes)
 
-        Args:
-            with_attributes: Include account master data (default: True)
-            without_attributes: Comma-separated list of attributes to exclude (optional)
-
-        Returns:
-            List of AccountBalance objects
-
-        Raises:
-            TokenExpiredError: If authentication token is expired
-            ValidationError: If request parameters are invalid (422)
-            ServerError: If API server returns 500 error
-            NetworkTimeoutError: If request times out
-        """
-        await self._ensure_authenticated()
-
-        logger.debug("Fetching account balances")
-
-        # Build query parameters
-        params: dict[str, str] = {}
-        if not with_attributes:
-            params["without-attr"] = "account"
-        if without_attributes:
-            if "without-attr" in params:
-                params["without-attr"] += f",{without_attributes}"
-            else:
-                params["without-attr"] = without_attributes
-
-        try:
-            response = await self._http_client.get(
-                f"{self.base_url}/api/banking/clients/user/v2/accounts/balances",
-                headers={
-                    "Authorization": f"Bearer {self._access_token}",
-                    "Accept": "application/json",
-                    "x-http-request-info": self._get_request_info_header(),
-                },
-                params=params if params else None,
-            )
-
-            if response.status_code == 401:
-                logger.warning("API request failed - token expired")
-                success = await self.refresh_token()
-                if not success:
-                    self._invoke_reauth_callback("api_request_unauthorized")
-                    raise TokenExpiredError("Token expired and refresh failed")
-                # Retry request with new token
-                return await self.get_account_balances(with_attributes, without_attributes)
-
-            if response.status_code == 422:
-                logger.error("Account balances request failed - validation error")
-                raise ValidationError("Invalid request parameters for account balances")
-
-            if response.status_code == 500:
-                logger.error("API server error during account balances request")
-                raise ServerError("API server returned 500 Internal Server Error")
-
-            response.raise_for_status()
-            data = response.json()
-
-            balances = [AccountBalance.from_dict(item) for item in data["values"]]
-            logger.info(f"Retrieved {len(balances)} account balances")
-            logger.debug(f"Parsed {len(balances)} account balance objects")
-
-            return balances
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during API request")
-            raise NetworkTimeoutError("Account balances request timed out") from e
+        response = await http_api.get_account_balances(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            params=params or None,
+        )
+        balances = [AccountBalance.from_dict(item) for item in response["values"]]
+        logger.info("Retrieved %d account balances", len(balances))
+        return balances
 
     async def get_transactions(
         self,
@@ -893,125 +225,247 @@ class ComdirectClient:
         transaction_direction: Optional[str] = None,
         with_attributes: bool = True,
         without_attributes: Optional[str] = None,
+        min_booking_date: Optional[str] = None,
+        max_booking_date: Optional[str] = None,
+        paging_count: int = 500,
+        paging_first: int = 0,
     ) -> list[Transaction]:
-        """Retrieve **all available** transactions for a specific account.
+        """Fetch one page of transactions (up to 500) for an account.
 
-        This method now uses the API's maximum page size to fetch up to
-        500 transactions in a single call (API limit). For accounts with more
-        than 500 transactions, only the most recent 500 will be returned.
+        Defaults to the most recent 500 transactions within the API's default
+        window. For accounts with more than 500 matching transactions, use
+        :meth:`iter_all_booked_transactions` for full pagination.
 
-        Args:
-            account_id: Account UUID (from AccountBalance.accountId)
-            transaction_state: Optional filter: "BOOKED", "NOTBOOKED", or "BOTH" (default: "BOTH")
-            transaction_direction: Optional filter: "CREDIT", "DEBIT", or "CREDIT_AND_DEBIT" (default: "CREDIT_AND_DEBIT")
-            with_attributes: Include account details in response (default: True)
-            without_attributes: Comma-separated list of attributes to exclude (optional)
+        New optional parameters (verified via ``COMDIRECT_API.md``):
 
-        Returns:
-            List of Transaction objects (up to 500 per call)
-
-        Raises:
-            TokenExpiredError: If authentication token is expired
-            AccountNotFoundError: If account does not exist
-            ValidationError: If request parameters are invalid (422)
-            ServerError: If API server returns 500 error
-            NetworkTimeoutError: If request times out
+        * ``min_booking_date`` / ``max_booking_date`` — ISO ``YYYY-MM-DD``
+          date range. ``min_booking_date`` also unlocks access to history
+          older than the default ~6-month window.
+        * ``paging_first`` — zero-based offset. Requires
+          ``transaction_state="BOOKED"`` per the API (see pitfall #10 in
+          ``COMDIRECT_API.md``).
+        * ``paging_count`` — page size, capped server-side at 500.
         """
-        await self._ensure_authenticated()
+        await self._ensure_fresh_token()
 
-        # Build query parameters with maximum page size
-        params: dict[str, str] = {"paging-count": "500"}
+        params: dict[str, str] = {"paging-count": str(paging_count)}
+        if paging_first:
+            params["paging-first"] = str(paging_first)
         if transaction_state:
             params["transactionState"] = transaction_state
         if transaction_direction:
             params["transactionDirection"] = transaction_direction
+        if min_booking_date:
+            params["min-bookingDate"] = min_booking_date
+        if max_booking_date:
+            params["max-bookingDate"] = max_booking_date
         if not with_attributes:
             params["without-attr"] = "account"
         if without_attributes:
             if "without-attr" in params:
-                params["without-attr"] += f",{without_attributes}"
+                params["without-attr"] = f"{params['without-attr']},{without_attributes}"
             else:
                 params["without-attr"] = without_attributes
 
-        log_msg = f"Fetching ALL transactions for account {account_id[:8]}... (max: {params['paging-count']})"
-        if transaction_direction:
-            log_msg += f" (direction: {transaction_direction})"
-        if transaction_state:
-            log_msg += f" (state: {transaction_state})"
-        logger.debug(log_msg)
+        response = await http_api.get_transactions(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            account_id=account_id,
+            params=params,
+        )
+        transactions = [Transaction.from_dict(item) for item in response["values"]]
+        logger.info(
+            "Retrieved %d transactions for account %s",
+            len(transactions),
+            account_id[:8],
+        )
+        return transactions
 
+    async def fetch_all_booked_transactions(
+        self,
+        account_id: str,
+        min_booking_date: str = "2000-01-01",
+        transaction_direction: Optional[str] = None,
+    ) -> list[Transaction]:
+        """Walk every booked transaction on an account, bypassing the 500 cap.
+
+        Implements the strategy documented in ``COMDIRECT_API.md``
+        §"Pagination rules": force ``transactionState=BOOKED``, widen
+        ``min-bookingDate`` to unlock historical data, then step through
+        ``paging-first`` in 500-sized windows until a short page is returned.
+        """
+        all_transactions: list[Transaction] = []
+        offset = 0
+        while True:
+            page = await self.get_transactions(
+                account_id,
+                transaction_state="BOOKED",
+                transaction_direction=transaction_direction,
+                min_booking_date=min_booking_date,
+                paging_count=500,
+                paging_first=offset,
+            )
+            all_transactions.extend(page)
+            if len(page) < 500:
+                break
+            offset += 500
+        return all_transactions
+
+    # ------------------------------------------------------------------
+    # Token management helpers
+    # ------------------------------------------------------------------
+
+    def _store_auth_result(self, result: AuthResult) -> None:
+        self._access_token = result.access_token
+        self._refresh_token = result.refresh_token
+        self._token_expiry = _utc_now() + timedelta(seconds=result.expires_in)
+        self._save_tokens_to_storage()
+
+    def _require_access_token(self) -> str:
+        """Return the access token, raising if the client is not authenticated.
+
+        The banking endpoints call this after ``_ensure_fresh_token`` so they
+        can safely dereference ``self._access_token``.
+        """
+        if self._access_token is None:
+            raise TokenExpiredError("Not authenticated")
+        return self._access_token
+
+    async def _ensure_fresh_token(self) -> None:
+        """Refresh the token if it is about to expire (or already expired).
+
+        Uses the same threshold as the background task so a call that races
+        with expiry doesn't have to eat a 401 first.
+        """
+        if not self.is_authenticated():
+            raise TokenExpiredError("Not authenticated")
+        assert self._token_expiry is not None
+        threshold = self._token_expiry - timedelta(seconds=self.token_refresh_threshold)
+        if _utc_now() >= threshold:
+            logger.debug("Token near expiry — refreshing before request")
+            if not await self.refresh_token():
+                raise TokenExpiredError("Token expired and refresh failed")
+
+    def _clear_tokens(self) -> None:
+        """Drop tokens from memory AND persistent storage."""
+        self._access_token = None
+        self._refresh_token = None
+        self._token_expiry = None
+        self._token_storage.clear_tokens()
+        logger.debug("Tokens cleared (memory + storage)")
+
+    def _save_tokens_to_storage(self) -> None:
+        if self._access_token and self._refresh_token and self._token_expiry:
+            try:
+                self._token_storage.save_tokens(
+                    self._access_token, self._refresh_token, self._token_expiry
+                )
+            except TokenStorageError as e:
+                logger.warning("Failed to save tokens to storage: %s", e)
+
+    def _try_restore_tokens(self) -> None:
+        """Best-effort restore on construction.
+
+        The background refresh task is NOT started here — it needs a running
+        event loop, and the client is usually constructed synchronously
+        before ``asyncio.run``. The task starts on the first
+        ``authenticate`` / ``refresh_token`` call instead.
+        """
         try:
-            response = await self._http_client.get(
-                f"{self.base_url}/api/banking/v1/accounts/{account_id}/transactions",
-                headers={
-                    "Authorization": f"Bearer {self._access_token}",
-                    "Accept": "application/json",
-                    "x-http-request-info": self._get_request_info_header(),
-                },
-                params=params,
-            )
-
-            if response.status_code == 401:
-                logger.warning("API request failed - token expired")
-                success = await self.refresh_token()
-                if not success:
-                    self._invoke_reauth_callback("api_request_unauthorized")
-                    raise TokenExpiredError("Token expired and refresh failed")
-                # Retry request with new token
-                return await self.get_transactions(
-                    account_id,
-                    transaction_state,
-                    transaction_direction,
-                    with_attributes,
-                    without_attributes,
-                )
-
-            if response.status_code == 404:
-                logger.error(f"Account {account_id[:8]}... not found")
-                raise AccountNotFoundError(f"Account {account_id} not found")
-
-            if response.status_code == 422:
-                logger.error("Transactions request failed - validation error")
-                raise ValidationError("Invalid request parameters for transactions")
-
-            if response.status_code == 500:
-                logger.error("API server error during transactions request")
-                raise ServerError("API server returned 500 Internal Server Error")
-
-            response.raise_for_status()
-            data = response.json()
-
-            transactions = [Transaction.from_dict(item) for item in data["values"]]
+            tokens = self._token_storage.load_tokens()
+        except TokenStorageError as e:
+            logger.warning("Failed to restore tokens from storage: %s", e)
+            return
+        if tokens:
+            self._access_token, self._refresh_token, self._token_expiry = tokens
             logger.info(
-                f"Retrieved {len(transactions)} transactions for account {account_id[:8]}..."
+                "Tokens restored from storage (expires: %s)",
+                self._token_expiry.isoformat(),
             )
-            logger.debug(f"Parsed {len(transactions)} transaction objects")
 
-            # Log pagination info for debugging
-            if "paging" in data:
-                paging_info = data["paging"]
-                logger.debug(
-                    f"Pagination: index={paging_info.get('index')}, matches={paging_info.get('matches')}"
-                )
+    # ------------------------------------------------------------------
+    # Background refresh loop
+    # ------------------------------------------------------------------
 
-            return transactions
-
-        except httpx.TimeoutException as e:
-            logger.error("Network timeout during API request")
-            raise NetworkTimeoutError("Transactions request timed out") from e
-
-    async def close(self) -> None:
-        """Close the HTTP client and cleanup resources."""
+    def _start_refresh_task(self) -> None:
         if self._refresh_task and not self._refresh_task.done():
-            self._refresh_task.cancel()
+            return
+        try:
+            self._refresh_task = asyncio.create_task(self._refresh_loop())
+        except RuntimeError:
+            # No running event loop — refresh will happen lazily via
+            # _ensure_fresh_token() on the next API call.
+            logger.debug("No running event loop; skipping background refresh task")
+            return
+        logger.info("Token refresh task started")
 
-        await self._http_client.aclose()
-        logger.info("ComdirectClient closed")
+    async def _stop_refresh_task(self) -> None:
+        task = self._refresh_task
+        self._refresh_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            logger.debug("Token refresh task cancelled")
 
-    async def __aenter__(self) -> "ComdirectClient":
-        """Async context manager entry."""
-        return self
+    async def _refresh_loop(self) -> None:
+        """Sleep until the token is close to expiry, refresh, repeat."""
+        try:
+            while True:
+                if self._token_expiry is None:
+                    await asyncio.sleep(10)
+                    continue
+                sleep_seconds = (
+                    self._token_expiry
+                    - _utc_now()
+                    - timedelta(seconds=self.token_refresh_threshold)
+                ).total_seconds()
+                if sleep_seconds > 0:
+                    logger.debug("Next token refresh in %.0fs", sleep_seconds)
+                    await asyncio.sleep(sleep_seconds)
+                if not await self.refresh_token():
+                    logger.error("Automatic token refresh failed; stopping loop")
+                    await self._invoke_reauth_callback("automatic_refresh_failed")
+                    return
+        except asyncio.CancelledError:
+            logger.info("Token refresh task cancelled")
+            raise
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Async context manager exit."""
-        await self.close()
+    # ------------------------------------------------------------------
+    # Reauth callback
+    # ------------------------------------------------------------------
+
+    async def _invoke_reauth_callback(self, reason: str) -> None:
+        """Clear tokens and call the user-supplied reauth callback.
+
+        Supports both sync and async callbacks.
+        """
+        self._clear_tokens()
+        logger.warning("Reauthentication required — reason: %s", reason)
+        if self.reauth_callback is None:
+            logger.warning("Reauth required but no callback registered")
+            return
+        try:
+            result = self.reauth_callback(reason)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:  # noqa: BLE001 — user code shouldn't break the client
+            logger.error("Error in reauth callback: %s", e)
+
+
+def _build_without_attr_params(
+    with_attributes: bool, without_attributes: Optional[str]
+) -> dict[str, str]:
+    params: dict[str, str] = {}
+    if not with_attributes:
+        params["without-attr"] = "account"
+    if without_attributes:
+        if "without-attr" in params:
+            params["without-attr"] = f"{params['without-attr']},{without_attributes}"
+        else:
+            params["without-attr"] = without_attributes
+    return params

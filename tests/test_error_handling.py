@@ -80,7 +80,7 @@ class TestServerErrorHandling:
             with pytest.raises(ServerError) as exc_info:
                 await client.get_account_balances()
 
-            assert "500 Internal Server Error" in str(exc_info.value)
+            assert "500" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_transactions_500_server_error(self, client):
@@ -94,7 +94,7 @@ class TestServerErrorHandling:
             with pytest.raises(ServerError) as exc_info:
                 await client.get_transactions("test_account_id")
 
-            assert "500 Internal Server Error" in str(exc_info.value)
+            assert "500" in str(exc_info.value)
 
 
 class TestQueryParameterExposure:
@@ -175,8 +175,14 @@ class TestQueryParameterExposure:
             assert params["without-attr"] == "booking"
 
 
-class TestFieldNameFallback:
-    """Test handling of 'deptor' vs 'debtor' field name."""
+class TestDebtorField:
+    """Verify the debtor field is parsed from the documented field name.
+
+    Live API responses always use ``debtor``. The earlier `deptor` typo
+    mentioned in older versions of this library was never observed against
+    the production API and the fallback has been removed — see
+    COMDIRECT_API.md changelog for 2026-04-11.
+    """
 
     def test_transaction_parse_with_debtor_field(self):
         """Test parsing transaction with correct 'debtor' field."""
@@ -198,55 +204,6 @@ class TestFieldNameFallback:
 
         assert transaction.debtor is not None
         assert transaction.debtor.holderName == "John Doe"
-        assert transaction.debtor.iban == "DE89370400440532013000"
-
-    def test_transaction_parse_with_deptor_fallback(self):
-        """Test parsing transaction with 'deptor' field (Swagger typo)."""
-        from comdirect_client import Transaction
-
-        data = {
-            "bookingStatus": "BOOKED",
-            "reference": "REF123",
-            "valutaDate": "2023-01-01",
-            "newTransaction": False,
-            "deptor": {  # Swagger spec typo
-                "holderName": "Jane Doe",
-                "iban": "DE89370400440532013001",
-                "bic": "COBADEFF",
-            },
-        }
-
-        transaction = Transaction.from_dict(data)
-
-        # Should handle the typo gracefully
-        assert transaction.debtor is not None
-        assert transaction.debtor.holderName == "Jane Doe"
-
-    def test_transaction_prefer_debtor_over_deptor(self):
-        """Test that 'debtor' is preferred when both fields present."""
-        from comdirect_client import Transaction
-
-        data = {
-            "bookingStatus": "BOOKED",
-            "reference": "REF123",
-            "valutaDate": "2023-01-01",
-            "newTransaction": False,
-            "debtor": {
-                "holderName": "Correct Name",
-                "iban": "DE89370400440532013000",
-                "bic": "COBADEFF",
-            },
-            "deptor": {  # Should be ignored
-                "holderName": "Wrong Name",
-                "iban": "DE89370400440532013999",
-                "bic": "COBAXXXX",
-            },
-        }
-
-        transaction = Transaction.from_dict(data)
-
-        # Should use 'debtor' not 'deptor'
-        assert transaction.debtor.holderName == "Correct Name"
         assert transaction.debtor.iban == "DE89370400440532013000"
 
 

@@ -138,3 +138,14 @@ dmypy.json
 # Token storage files
 tokens.json
 tokens/
+
+# Claude Code workspace
+.claude/
+
+# Local credential / test scripts
+test.sh
+
+# Example output artifacts
+transactions.json
+transactions_parsed.json
+transactions_with_nulls.json
