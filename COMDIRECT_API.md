@@ -941,6 +941,34 @@ Cross-checked against the comdirect online banking web UI for the account under 
 **Error**: 422 `{"key": "requestparameter.invalid", "message": "Paging is only valid for booked account transactions", "origin": ["transactionState"]}`
 **Solution**: `paging-first > 0` only works with `transactionState=BOOKED`. Fetch pending transactions in a single unpaged call (`transactionState=NOTBOOKED`), paginate only the booked history.
 
+### 11. Document download requires a matching `Accept` header
+**Error**: `406 Not Acceptable` from `GET /api/messages/v2/documents/{documentId}` and `…/predocument` when the default `Accept: application/json` header is sent.
+
+**Why**: These endpoints return binary content (`text/html` or `application/pdf`) — the official Swagger declares `produces: ["text/html", "application/pdf"]` with no JSON option. The API enforces content negotiation and rejects any request that does not advertise a matching Accept value.
+
+**Solution**: Set `Accept` to the actual MIME type you want (or the comma-separated list of both) before calling the endpoint:
+
+```http
+Accept: application/pdf, text/html
+```
+
+Source: the official `comdirect_rest_api_swagger.json` declares the `produces` list; the 406 behaviour is reported by devmapal's fork of the Python library based on live API experience (see commit `9db8b65`). Not reproduced by our own live testing yet — the mapping to 406 specifically is the fork author's observation rather than documented elsewhere.
+
+---
+
+## Brokerage date / timestamp filter conventions
+
+The banking and brokerage modules use different date formats for range filters. This is inconsistent across the API and is not spelled out in a single place in the official docs — collected here from the official Swagger's parameter descriptions.
+
+| Endpoint | Parameter | Format | Example |
+|---|---|---|---|
+| `GET /api/banking/v1/accounts/{accountId}/transactions` | `min-bookingDate`, `max-bookingDate` | ISO date `YYYY-MM-DD` | `2025-06-01` |
+| `GET /api/brokerage/v3/depots/{depotId}/transactions` | `min-bookingDate`, `max-bookingDate` | ISO date **or** negative offset string | `2025-06-01` **or** `-10d` (meaning "last 10 days") |
+| `GET /api/brokerage/depots/{depotId}/v3/orders` | `min-creationTimeStamp`, `max-creationTimeStamp` | UTC timestamp `YYYY-MM-DDThh:mm:ss,ff` | `2026-04-11T18:37:11,55` |
+| `GET /api/messages/clients/{user}/v2/documents` | `min-documentDate`, `max-documentDate` | ISO date `YYYY-MM-DD` | `2025-06-01` |
+
+**Source**: the corresponding `parameters[].description` fields in `comdirect_rest_api_swagger.json` (quoted verbatim: *"in UTC with the following format: YYYY-MM-DDThh:mm:ss,ff"*, *"Earliest booking date of the transaction. Format: YYYY-MM-DD or as negative offset from the current date e.g. -10d"*). Not verified against live API calls by this document's tests — file a correction PR if you hit deviations.
+
 ---
 
 ## State Management

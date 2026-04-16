@@ -34,12 +34,23 @@ import httpx
 
 from comdirect_client import http_api
 from comdirect_client.auth_flow import (
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    DEFAULT_POLL_TIMEOUT_SECONDS,
     AuthResult,
     TanStatusCallback,
     perform_authentication,
 )
 from comdirect_client.exceptions import TokenExpiredError
 from comdirect_client.models import AccountBalance, Transaction
+from comdirect_client.models_brokerage import (
+    Depot,
+    DepotPosition,
+    DepotTransaction,
+    Instrument,
+    Order,
+)
+from comdirect_client.models_messages import Document
+from comdirect_client.models_reports import ProductBalance
 from comdirect_client.token_storage import TokenPersistence, TokenStorageError
 
 logger = logging.getLogger(__name__)
@@ -70,6 +81,8 @@ class ComdirectClient:
         token_refresh_threshold_seconds: int = 120,
         timeout_seconds: float = 30.0,
         token_storage_path: Optional[str] = None,
+        tan_timeout_seconds: int = DEFAULT_POLL_TIMEOUT_SECONDS,
+        tan_poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
@@ -80,6 +93,8 @@ class ComdirectClient:
         self.tan_status_callback = tan_status_callback
         self.token_refresh_threshold = token_refresh_threshold_seconds
         self.timeout_seconds = timeout_seconds
+        self.tan_timeout_seconds = tan_timeout_seconds
+        self.tan_poll_interval_seconds = tan_poll_interval_seconds
 
         self._token_storage = TokenPersistence(token_storage_path)
 
@@ -157,6 +172,8 @@ class ComdirectClient:
                 password=self._password,
                 session_id=self._session_id,
                 tan_status_callback=self.tan_status_callback,
+                tan_timeout_seconds=self.tan_timeout_seconds,
+                tan_poll_interval_seconds=self.tan_poll_interval_seconds,
             )
         except Exception:
             self._clear_tokens()
@@ -312,6 +329,282 @@ class ComdirectClient:
                 break
             offset += 500
         return all_transactions
+
+    # ------------------------------------------------------------------
+    # Brokerage endpoints (read-only)
+    # ------------------------------------------------------------------
+
+    async def get_depots(self) -> list[Depot]:
+        """Return the customer's depots (securities accounts)."""
+        await self._ensure_fresh_token()
+        response = await http_api.get_depots(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+        )
+        return [Depot.from_dict(item) for item in response["values"]]
+
+    async def get_depot_positions(
+        self,
+        depot_id: str,
+        with_instrument: bool = True,
+        without_attributes: Optional[str] = None,
+    ) -> list[DepotPosition]:
+        """Return the holdings inside a specific depot.
+
+        ``with_instrument=True`` includes the nested ``instrument`` object.
+        """
+        await self._ensure_fresh_token()
+        params: dict[str, str] = {}
+        if with_instrument:
+            params["with-attr"] = "instrument"
+        if without_attributes:
+            params["without-attr"] = without_attributes
+        response = await http_api.get_depot_positions(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            depot_id=depot_id,
+            params=params or None,
+        )
+        return [DepotPosition.from_dict(item) for item in response["values"]]
+
+    async def get_depot_position(
+        self,
+        depot_id: str,
+        position_id: str,
+        with_instrument: bool = True,
+    ) -> DepotPosition:
+        """Return one specific holding inside a depot."""
+        await self._ensure_fresh_token()
+        params: dict[str, str] = {"with-attr": "instrument"} if with_instrument else {}
+        response = await http_api.get_depot_position(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            depot_id=depot_id,
+            position_id=position_id,
+            params=params or None,
+        )
+        return DepotPosition.from_dict(response)
+
+    async def get_depot_transactions(
+        self,
+        depot_id: str,
+        wkn: Optional[str] = None,
+        isin: Optional[str] = None,
+        instrument_id: Optional[str] = None,
+        booking_status: Optional[str] = None,  # BOOKED / NOTBOOKED / BOTH
+        transaction_direction: Optional[str] = None,  # IN / OUT
+        transaction_type: Optional[str] = None,  # BUY / SELL / TRANSFER_IN / TRANSFER_OUT
+        min_booking_date: Optional[str] = None,
+        max_booking_date: Optional[str] = None,
+        min_transaction_value: Optional[str] = None,
+        max_transaction_value: Optional[str] = None,
+    ) -> list[DepotTransaction]:
+        """Return buy/sell/transfer history for a depot.
+
+        ``min_booking_date`` / ``max_booking_date`` accept either ISO dates
+        (``YYYY-MM-DD``) or negative offsets (``-10d``) per the API spec.
+        """
+        await self._ensure_fresh_token()
+        params: dict[str, str] = {}
+        for key, value in [
+            ("WKN", wkn),
+            ("ISIN", isin),
+            ("instrumentId", instrument_id),
+            ("bookingStatus", booking_status),
+            ("transactionDirection", transaction_direction),
+            ("transactionType", transaction_type),
+            ("min-bookingDate", min_booking_date),
+            ("max-bookingDate", max_booking_date),
+            ("min-transactionValue", min_transaction_value),
+            ("max-transactionValue", max_transaction_value),
+        ]:
+            if value is not None:
+                params[key] = value
+        response = await http_api.get_depot_transactions(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            depot_id=depot_id,
+            params=params or None,
+        )
+        return [DepotTransaction.from_dict(item) for item in response["values"]]
+
+    async def get_depot_orders(
+        self,
+        depot_id: str,
+        order_status: Optional[str] = None,
+        venue_id: Optional[str] = None,
+        order_type: Optional[str] = None,
+        side: Optional[str] = None,
+        isin: Optional[str] = None,
+        wkn: Optional[str] = None,
+        instrument_id: Optional[str] = None,
+        min_creation_timestamp: Optional[str] = None,
+        max_creation_timestamp: Optional[str] = None,
+    ) -> list[Order]:
+        """Return the order book for a depot.
+
+        ``min_creation_timestamp`` / ``max_creation_timestamp`` use the
+        comma-second UTC format from the Swagger:
+        ``YYYY-MM-DDThh:mm:ss,ff``.
+        """
+        await self._ensure_fresh_token()
+        params: dict[str, str] = {}
+        for key, value in [
+            ("orderStatus", order_status),
+            ("venueId", venue_id),
+            ("orderType", order_type),
+            ("side", side),
+            ("ISIN", isin),
+            ("WKN", wkn),
+            ("instrumentId", instrument_id),
+            ("min-creationTimeStamp", min_creation_timestamp),
+            ("max-creationTimeStamp", max_creation_timestamp),
+        ]:
+            if value is not None:
+                params[key] = value
+        response = await http_api.get_depot_orders(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            depot_id=depot_id,
+            params=params or None,
+        )
+        return [Order.from_dict(item) for item in response["values"]]
+
+    async def get_order(self, order_id: str) -> Order:
+        """Return one order, including all executions."""
+        await self._ensure_fresh_token()
+        response = await http_api.get_order(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            order_id=order_id,
+        )
+        return Order.from_dict(response)
+
+    async def get_instrument(
+        self,
+        instrument_id: str,
+        with_attributes: Optional[str] = None,
+    ) -> Instrument:
+        """Look up an instrument by WKN, ISIN, mnemonic or UUID."""
+        await self._ensure_fresh_token()
+        params: dict[str, str] = {}
+        if with_attributes:
+            params["with-attr"] = with_attributes
+        response = await http_api.get_instrument(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            instrument_id=instrument_id,
+            params=params or None,
+        )
+        return Instrument.from_dict(response["values"][0])
+
+    # ------------------------------------------------------------------
+    # Messages / documents
+    # ------------------------------------------------------------------
+
+    async def get_documents(
+        self,
+        min_document_date: Optional[str] = None,
+        max_document_date: Optional[str] = None,
+        paging_count: Optional[int] = None,
+        paging_first: Optional[int] = None,
+    ) -> list[Document]:
+        """List documents in the customer's PostBox."""
+        await self._ensure_fresh_token()
+        params: dict[str, str] = {}
+        if min_document_date:
+            params["min-documentDate"] = min_document_date
+        if max_document_date:
+            params["max-documentDate"] = max_document_date
+        if paging_count is not None:
+            params["paging-count"] = str(paging_count)
+        if paging_first is not None:
+            params["paging-first"] = str(paging_first)
+        response = await http_api.get_documents(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            params=params or None,
+        )
+        return [Document.from_dict(item) for item in response["values"]]
+
+    async def get_document_content(
+        self,
+        document_id: str,
+        predocument: bool = False,
+        accept: str = "application/pdf, text/html",
+    ) -> tuple[bytes, str]:
+        """Download a document as raw bytes.
+
+        Returns ``(content, content_type)`` where ``content_type`` is the
+        value of the response's ``Content-Type`` header (``application/pdf``
+        or ``text/html``). See COMDIRECT_API.md §11 for why you cannot reuse
+        the library's default JSON ``Accept`` header here.
+        """
+        await self._ensure_fresh_token()
+        return await http_api.get_document_content(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            document_id=document_id,
+            accept=accept,
+            predocument=predocument,
+        )
+
+    # ------------------------------------------------------------------
+    # Reports
+    # ------------------------------------------------------------------
+
+    async def get_all_balances(
+        self,
+        product_type: Optional[str] = None,
+        client_connection_type: Optional[str] = None,
+        target_client_id: Optional[str] = None,
+        without_attributes: Optional[str] = None,
+    ) -> list[ProductBalance]:
+        """Consolidated balance view across accounts, depots, cards, loans,
+        and fixed-term savings.
+
+        Filter with ``product_type`` (e.g. ``ACCOUNT``, ``DEPOT``, ``CARD``,
+        ``INSTALLMENT_LOAN``, ``FIXED_TERM_SAVINGS``),
+        ``client_connection_type`` or ``target_client_id``. The per-entry
+        ``balance`` field is returned as a raw dict because its shape
+        depends on ``productType`` — see ``ProductBalance`` for details.
+        """
+        await self._ensure_fresh_token()
+        params: dict[str, str] = {}
+        if product_type:
+            params["productType"] = product_type
+        if client_connection_type:
+            params["clientConnectionType"] = client_connection_type
+        if target_client_id:
+            params["targetClientId"] = target_client_id
+        if without_attributes:
+            params["without-attr"] = without_attributes
+        response = await http_api.get_all_balances(
+            self._http_client,
+            self.base_url,
+            access_token=self._require_access_token(),
+            session_id=self._session_id,
+            params=params or None,
+        )
+        return [ProductBalance.from_dict(item) for item in response["values"]]
 
     # ------------------------------------------------------------------
     # Token management helpers

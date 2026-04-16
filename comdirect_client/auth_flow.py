@@ -25,8 +25,10 @@ from comdirect_client.exceptions import AuthenticationError, TANTimeoutError
 logger = logging.getLogger(__name__)
 
 PUSH_TAN = "P_TAN_PUSH"
-POLL_INTERVAL_SECONDS = 1.0
-POLL_TIMEOUT_SECONDS = 60
+# Sensible defaults for push-TAN polling. Override via ComdirectClient
+# constructor kwargs when the user is slow to approve on their phone.
+DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+DEFAULT_POLL_TIMEOUT_SECONDS = 60
 
 
 @dataclass
@@ -51,13 +53,15 @@ async def perform_authentication(
     password: str,
     session_id: str,
     tan_status_callback: Optional[TanStatusCallback] = None,
+    tan_timeout_seconds: int = DEFAULT_POLL_TIMEOUT_SECONDS,
+    tan_poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
 ) -> AuthResult:
     """Run the full 5-step auth flow and return the banking-scope tokens.
 
     Raises ``AuthenticationError`` for unrecoverable failures (bad
     credentials, unsupported TAN type, missing challenge headers),
     ``TANTimeoutError`` if the user does not approve the push-TAN within
-    60 seconds, and the usual network exceptions from ``httpx``.
+    ``tan_timeout_seconds``, and the usual network exceptions from ``httpx``.
     """
 
     # Step 1 — password grant → short-lived TWO_FACTOR token.
@@ -101,7 +105,7 @@ async def perform_authentication(
         {
             "tan_type": tan_type,
             "challenge_id": challenge_id,
-            "timeout_seconds": POLL_TIMEOUT_SECONDS,
+            "timeout_seconds": tan_timeout_seconds,
         },
     )
 
@@ -127,6 +131,8 @@ async def perform_authentication(
         poll_url=poll_url,
         tan_type=tan_type,
         tan_status_callback=tan_status_callback,
+        timeout_seconds=tan_timeout_seconds,
+        poll_interval_seconds=tan_poll_interval_seconds,
     )
 
     # Step 4b — finalise session activation.
@@ -166,22 +172,24 @@ async def _wait_for_push_tan(
     poll_url: str,
     tan_type: str,
     tan_status_callback: Optional[TanStatusCallback],
+    timeout_seconds: int,
+    poll_interval_seconds: float,
 ) -> None:
     """Poll the push-TAN status endpoint until approved or timeout."""
-    logger.info("Waiting for push-TAN approval (timeout: %ds)", POLL_TIMEOUT_SECONDS)
+    logger.info("Waiting for push-TAN approval (timeout: %ds)", timeout_seconds)
     _notify_tan_status(
         tan_status_callback,
         "pending",
         {
             "tan_type": tan_type,
-            "timeout_seconds": POLL_TIMEOUT_SECONDS,
+            "timeout_seconds": timeout_seconds,
             "elapsed_seconds": 0,
         },
     )
 
     start = time.monotonic()
-    while time.monotonic() - start < POLL_TIMEOUT_SECONDS:
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+    while time.monotonic() - start < timeout_seconds:
+        await asyncio.sleep(poll_interval_seconds)
         elapsed = int(time.monotonic() - start)
         status = await http_api.poll_tan_status(
             http,
@@ -205,9 +213,9 @@ async def _wait_for_push_tan(
                     "pending",
                     {
                         "tan_type": tan_type,
-                        "timeout_seconds": POLL_TIMEOUT_SECONDS,
+                        "timeout_seconds": timeout_seconds,
                         "elapsed_seconds": elapsed,
-                        "remaining_seconds": POLL_TIMEOUT_SECONDS - elapsed,
+                        "remaining_seconds": timeout_seconds - elapsed,
                     },
                 )
             continue
@@ -216,9 +224,9 @@ async def _wait_for_push_tan(
     _notify_tan_status(
         tan_status_callback,
         "timeout",
-        {"tan_type": tan_type, "timeout_seconds": POLL_TIMEOUT_SECONDS},
+        {"tan_type": tan_type, "timeout_seconds": timeout_seconds},
     )
-    raise TANTimeoutError(f"TAN approval timed out after {POLL_TIMEOUT_SECONDS} seconds")
+    raise TANTimeoutError(f"TAN approval timed out after {timeout_seconds} seconds")
 
 
 def _notify_tan_status(

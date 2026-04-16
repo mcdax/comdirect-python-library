@@ -400,3 +400,261 @@ def _raise_for_banking_status(
         raise ServerError(f"API server returned {status} for {endpoint}")
     # Any other 4xx is treated as a generic validation error.
     raise ValidationError(f"Unexpected {status} response for {endpoint}")
+
+
+# ---------------------------------------------------------------------------
+# Brokerage endpoints (read-only)
+# ---------------------------------------------------------------------------
+
+
+async def get_depots(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """``GET /api/brokerage/clients/user/v3/depots`` — list depots."""
+    try:
+        response = await http.get(
+            f"{base_url}/api/brokerage/clients/user/v3/depots",
+            headers=_bearer_headers(access_token, session_id),
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Depots request timed out") from e
+    _raise_for_banking_status(response, endpoint="depots")
+    return response.json()  # type: ignore[no-any-return]
+
+
+async def get_depot_positions(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    depot_id: str,
+    params: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """``GET /api/brokerage/v3/depots/{depotId}/positions``."""
+    try:
+        response = await http.get(
+            f"{base_url}/api/brokerage/v3/depots/{depot_id}/positions",
+            headers=_bearer_headers(access_token, session_id),
+            params=params,
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Depot positions request timed out") from e
+    _raise_for_banking_status(response, endpoint="depot positions")
+    return response.json()  # type: ignore[no-any-return]
+
+
+async def get_depot_position(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    depot_id: str,
+    position_id: str,
+    params: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """``GET /api/brokerage/v3/depots/{depotId}/positions/{positionId}``."""
+    try:
+        response = await http.get(
+            f"{base_url}/api/brokerage/v3/depots/{depot_id}/positions/{position_id}",
+            headers=_bearer_headers(access_token, session_id),
+            params=params,
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Depot position request timed out") from e
+    _raise_for_banking_status(response, endpoint="depot position")
+    return response.json()  # type: ignore[no-any-return]
+
+
+async def get_depot_transactions(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    depot_id: str,
+    params: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """``GET /api/brokerage/v3/depots/{depotId}/transactions``.
+
+    Accepts ``min-bookingDate`` / ``max-bookingDate`` either as ISO dates or
+    as a relative offset string like ``-10d``.
+    """
+    try:
+        response = await http.get(
+            f"{base_url}/api/brokerage/v3/depots/{depot_id}/transactions",
+            headers=_bearer_headers(access_token, session_id),
+            params=params,
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Depot transactions request timed out") from e
+    _raise_for_banking_status(response, endpoint="depot transactions")
+    return response.json()  # type: ignore[no-any-return]
+
+
+async def get_depot_orders(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    depot_id: str,
+    params: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """``GET /api/brokerage/depots/{depotId}/v3/orders`` — order book.
+
+    Date range filters use the timestamp format
+    ``YYYY-MM-DDThh:mm:ss,ff`` (UTC) passed as ``min-creationTimeStamp`` /
+    ``max-creationTimeStamp``.
+    """
+    try:
+        response = await http.get(
+            f"{base_url}/api/brokerage/depots/{depot_id}/v3/orders",
+            headers=_bearer_headers(access_token, session_id),
+            params=params,
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Depot orders request timed out") from e
+    _raise_for_banking_status(response, endpoint="depot orders")
+    return response.json()  # type: ignore[no-any-return]
+
+
+async def get_order(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    order_id: str,
+) -> dict[str, Any]:
+    """``GET /api/brokerage/v3/orders/{orderId}`` — single order with
+    executions."""
+    try:
+        response = await http.get(
+            f"{base_url}/api/brokerage/v3/orders/{order_id}",
+            headers=_bearer_headers(access_token, session_id),
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Order request timed out") from e
+    _raise_for_banking_status(response, endpoint="order")
+    return response.json()  # type: ignore[no-any-return]
+
+
+async def get_instrument(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    instrument_id: str,
+    params: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """``GET /api/brokerage/v1/instruments/{instrumentId}``.
+
+    ``instrument_id`` can be a WKN, ISIN, mnemonic or comdirect's UUID.
+    """
+    try:
+        response = await http.get(
+            f"{base_url}/api/brokerage/v1/instruments/{instrument_id}",
+            headers=_bearer_headers(access_token, session_id),
+            params=params,
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Instrument request timed out") from e
+    _raise_for_banking_status(response, endpoint="instrument")
+    return response.json()  # type: ignore[no-any-return]
+
+
+# ---------------------------------------------------------------------------
+# Messages / documents
+# ---------------------------------------------------------------------------
+
+
+async def get_documents(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    params: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """``GET /api/messages/clients/user/v2/documents`` — list PostBox docs."""
+    try:
+        response = await http.get(
+            f"{base_url}/api/messages/clients/user/v2/documents",
+            headers=_bearer_headers(access_token, session_id),
+            params=params,
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Documents list request timed out") from e
+    _raise_for_banking_status(response, endpoint="documents")
+    return response.json()  # type: ignore[no-any-return]
+
+
+async def get_document_content(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    document_id: str,
+    accept: str = "application/pdf, text/html",
+    predocument: bool = False,
+) -> tuple[bytes, str]:
+    """``GET /api/messages/v2/documents/{documentId}`` (or ``/predocument``).
+
+    Returns ``(content_bytes, content_type)``. Pass ``predocument=True`` to
+    fetch the "Vorschaltseite" variant if ``documentMetaData.predocumentExists``
+    is true.
+
+    The default ``accept`` value covers both MIME types declared by the
+    official Swagger (``application/pdf`` and ``text/html``). Sending the
+    library-wide default ``Accept: application/json`` here leads to
+    ``406 Not Acceptable`` — see COMDIRECT_API.md §11.
+    """
+    suffix = "/predocument" if predocument else ""
+    path = f"{base_url}/api/messages/v2/documents/{document_id}{suffix}"
+    headers = _bearer_headers(access_token, session_id)
+    headers["Accept"] = accept
+    try:
+        response = await http.get(path, headers=headers)
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("Document download timed out") from e
+    _raise_for_banking_status(response, endpoint="document content")
+    return response.content, response.headers.get("content-type", "")
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+
+async def get_all_balances(
+    http: httpx.AsyncClient,
+    base_url: str,
+    *,
+    access_token: str,
+    session_id: str,
+    params: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """``GET /api/reports/participants/user/v1/allbalances``.
+
+    Consolidated balance view across accounts, depots, cards, loans and
+    fixed-term savings. Filter with ``productType`` /
+    ``clientConnectionType`` / ``targetClientId``.
+    """
+    try:
+        response = await http.get(
+            f"{base_url}/api/reports/participants/user/v1/allbalances",
+            headers=_bearer_headers(access_token, session_id),
+            params=params,
+        )
+    except httpx.TimeoutException as e:
+        raise NetworkTimeoutError("All balances request timed out") from e
+    _raise_for_banking_status(response, endpoint="all balances")
+    return response.json()  # type: ignore[no-any-return]
