@@ -942,7 +942,7 @@ Cross-checked against the comdirect online banking web UI for the account under 
 **Solution**: `paging-first > 0` only works with `transactionState=BOOKED`. Fetch pending transactions in a single unpaged call (`transactionState=NOTBOOKED`), paginate only the booked history.
 
 ### 11. Document download requires a matching `Accept` header
-**Error**: `406 Not Acceptable` from `GET /api/messages/v2/documents/{documentId}` and `…/predocument` when the default `Accept: application/json` header is sent.
+**Error**: `406 Not Acceptable` (empty body, no `x-http-response-info` header) from `GET /api/messages/v2/documents/{documentId}` and `…/predocument` when the default `Accept: application/json` header is sent.
 
 **Why**: These endpoints return binary content (`text/html` or `application/pdf`) — the official Swagger declares `produces: ["text/html", "application/pdf"]` with no JSON option. The API enforces content negotiation and rejects any request that does not advertise a matching Accept value.
 
@@ -952,7 +952,14 @@ Cross-checked against the comdirect online banking web UI for the account under 
 Accept: application/pdf, text/html
 ```
 
-Source: the official `comdirect_rest_api_swagger.json` declares the `produces` list; the 406 behaviour is reported by devmapal's fork of the Python library based on live API experience (see commit `9db8b65`). Not reproduced by our own live testing yet — the mapping to 406 specifically is the fork author's observation rather than documented elsewhere.
+**Verified 2026-04-16** against the production API on a real PostBox document:
+
+| `Accept` header | Status | Content-Type | Body |
+|---|---|---|---|
+| `application/json` | **406** | `*/*;charset=UTF-8` | empty (0 bytes) |
+| `application/pdf, text/html` | **200** | `text/html;charset=UTF-8` | 244143 bytes of HTML |
+
+The 406 response carries no `x-http-response-info` header and no body at all — the only signal the API gives you is the status code, so branch on `response.status_code == 406` rather than looking for a `BusinessMessage`.
 
 ---
 
@@ -1206,6 +1213,10 @@ If Step 3 or 4 fails:
 ---
 
 ## Changelog
+
+- **2026-04-16**: Verified every read-only library method against the production API on a real account.
+  - **Brokerage / messages / reports endpoints confirmed working**: `get_depots`, `get_depot_positions`, `get_depot_position`, `get_depot_transactions`, `get_depot_orders`, `get_instrument`, `get_documents`, `get_document_content`, `get_all_balances` — all returned 200 and correctly-shaped data on a test account with depots, positions and PostBox documents.
+  - **`406 Not Acceptable` on document downloads**: now **verified** against production (see §11). `Accept: application/json` returned status 406 with zero-byte body; `Accept: application/pdf, text/html` returned 200 with 244 KB of HTML. Upgraded the pitfall entry from "reported by fork author" to "verified".
 
 - **2026-04-11**: Cross-checked against the official `comdirect_REST_API_Dokumentation.pdf` (April 2020) and `comdirect_rest_api_swagger.json`, plus live testing against the production API and live comparison with the comdirect online banking web UI via Playwright:
   - **Added full `remittanceInfo` parsing section**: Verwendungszweck is a flat fixed-width string with no newlines, despite what the PDF says. Booked transactions use 37-char windows with 2-digit markers; pending transactions use 35-char unmarkered windows. Per-chunk normalization is `" ".join(content.split())` (full whitespace collapse, not just `rstrip`). SEPA labels (`End-to-End-Ref.:`, `CORE / Mandatsref.:`, `Gläubiger-ID:`) trigger structured extraction in the web UI and should be extracted the same way programmatically. Chunks are NEVER concatenated across windows, even when a word is wrapped mid-character. Includes reference Python implementation and 5 verified test cases.
